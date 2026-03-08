@@ -1,0 +1,162 @@
+fix_seed: 0
+checkpoints_every: 40
+tensorboard_log: True
+tqdm_progress_bar: True
+result_path: ./results/dihedral_hsplit_continue
+find_unused_parameters: True
+dispatch_batches: False
+even_batches: True
+non_blocking: False
+split_batches: False
+
+resume:
+  enabled: True
+  resume_path: "/data/ymxue/p2_rnavqvae/alex/rna_gcpvqvae/results/dihedral_hsplit_scratch/2026-03-01__19-12-31/checkpoints/epoch_40.pth"
+  restart_optimizer: False
+  discard_decoder_weights: False
+
+model:
+  compile_model: False
+  max_length: 512
+  decoder_output_scaling_factor: 1
+  use_ndlinear: False
+  encoder:
+    name: gcpnet
+    freeze_parameters: False
+    pretrained:
+      enabled: False
+      checkpoint_path: ./models/checkpoints/structure_denoising/gcpnet/ca_bb/last.ckpt
+  vqvae:
+    vector_quantization:
+      enabled: True
+      freeze_parameters: False
+      dim: 128
+      decay: 0.99
+      codebook_size: 2048
+      commitment_weight: 0.20
+      orthogonal_reg_weight: 0.05
+      orthogonal_reg_max_codes: 512
+      orthogonal_reg_active_codes_only: True
+      rotation_trick: False
+      threshold_ema_dead_code: 16
+      kmeans_init: True
+      kmeans_iters: 30
+      stochastic_sample_codes: False
+      sample_codebook_temp: 0.1
+      alpha: 0.15
+      tik_tok:
+        enabled: False
+        compression_factor: 8
+        residual_depth: 1
+        classifier_weight: 0.1
+        adaptive_coefficient: True
+    encoder:
+      freeze_parameters: False
+      dimension: 1024
+      ff_mult: 4
+      depth: 8
+      heads: 8
+      rotary_pos_emb: True
+      attn_flash: True
+      attn_kv_heads: 2
+      qk_norm: True
+      pre_norm: True
+      residual_attn: False
+      num_memory_tokens: 0
+      causal: False
+    decoder:
+      name: geometric_decoder
+      freeze_parameters: False
+
+train_settings:
+  data_modality: rna
+  new_rigid: False
+  new_rigid_max_samples: 100
+  data_path: /data/ymxue/p2_rnavqvae/alex/data/rnasolo_h5_homology_split_c80/splits/train
+  num_epochs: 40
+  sample_weighting:
+    enabled: True
+    min_weight: 1.0
+    max_weight: 3.0
+    threshold_length: 384
+  shuffle: True
+  mixed_precision: bf16
+  save_pdb_every: 999999
+  batch_size: 4
+  num_workers: 4
+  grad_accumulation: 1
+  max_task_samples: 100000
+  profile_train_loop: False
+  cutoff_augmentation:
+    enabled: False
+    probability: 0.5
+    min_length: 25
+  nan_augmentation:
+    enabled: True
+    probability: 0.05
+    max_length: 50
+    adaptive_missing:
+      enabled: True
+      max_missing_ratio: 0.30
+      min_scale: 0.20
+  gaussian_jitter:
+    enabled: False
+    std: 0.05
+    probability: 0.5
+  random_rotation:
+    enabled: False
+  gradient_norm_logging_freq: 50
+  log_separate_grad_norms: False
+  adaptive_loss_coefficient: False
+  losses:
+    alignment_strategy: kabsch
+    mse:
+      enabled: True
+      weight: 0.002
+      adaptive_coefficient: True
+    backbone_distance:
+      enabled: True
+      weight: 0.03
+      adaptive_coefficient: True
+    backbone_direction:
+      enabled: True
+      weight: 0.08
+      adaptive_coefficient: True
+    binned_distance_classification:
+      enabled: False
+      weight: 0.01
+      adaptive_coefficient: True
+    binned_direction_classification:
+      enabled: False
+      weight: 0.01
+      adaptive_coefficient: True
+    next_token_prediction:
+      enabled: False
+      weight: 0.001
+      adaptive_coefficient: True
+      blocks: 0
+    vq:
+      adaptive_coefficient: False
+
+valid_settings:
+  data_path: /data/ymxue/p2_rnavqvae/alex/data/rnasolo_h5_homology_split_c80/splits/val
+  do_every: 1
+  save_pdb_every: 999999
+  batch_size: 1
+  num_workers: 0
+
+optimizer:
+  name: adam
+  lr: 1e-5
+  weight_decouple: True
+  weight_decay: 1e-2
+  eps: 1e-7
+  beta_1: 0.9
+  beta_2: 0.98
+  use_8bit_adam: False
+  grad_clip_norm: 0.5
+  decay:
+    warmup: 30
+    min_lr: 1e-6
+    gamma: 0.2
+    num_restarts: 1

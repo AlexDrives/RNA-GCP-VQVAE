@@ -223,8 +223,19 @@ class GCPNetModel(torch.nn.Module):
             the dimension of the embeddings.
         :rtype: EncoderOutput
         """
-        # Centralize node positions to make them translation-invariant
-        pos_centroid, batch.pos = self.centralize(batch, batch_index=batch.batch)
+        # Centralize node positions to make them translation-invariant.
+        # Guard against NaNs by masking invalid nodes (if provided) and
+        # zeroing any non-finite values after centering.
+        node_mask = getattr(batch, "mask", None)
+        if node_mask is not None:
+            node_mask = node_mask.to(torch.bool)
+            batch.pos = torch.nan_to_num(batch.pos, nan=0.0, posinf=0.0, neginf=0.0)
+            pos_centroid, batch.pos = self.centralize(
+                batch, batch_index=batch.batch, node_mask=node_mask
+            )
+            batch.pos = torch.nan_to_num(batch.pos, nan=0.0, posinf=0.0, neginf=0.0)
+        else:
+            pos_centroid, batch.pos = self.centralize(batch, batch_index=batch.batch)
 
         # Install `h`, `chi`, `e`, and `xi` using corresponding features built by the `FeatureFactory`
         batch.h, batch.chi, batch.e, batch.xi = (
@@ -248,6 +259,7 @@ class GCPNetModel(torch.nn.Module):
                 batch.edge_index,
                 batch.f_ij,
                 node_pos=batch.pos,
+                node_mask=node_mask,
             )
 
         # Record final version of each feature in `Batch` object
@@ -263,9 +275,18 @@ class GCPNetModel(torch.nn.Module):
             )
             if self.predict_node_rep:
                 # prior to scalar node predictions, re-derive local frames after performing all node position updates
-                _, centralized_node_pos = self.centralize(
-                    batch, batch_index=batch.batch
-                )
+                if node_mask is not None:
+                    batch.pos = torch.nan_to_num(batch.pos, nan=0.0, posinf=0.0, neginf=0.0)
+                    _, centralized_node_pos = self.centralize(
+                        batch, batch_index=batch.batch, node_mask=node_mask
+                    )
+                    centralized_node_pos = torch.nan_to_num(
+                        centralized_node_pos, nan=0.0, posinf=0.0, neginf=0.0
+                    )
+                else:
+                    _, centralized_node_pos = self.centralize(
+                        batch, batch_index=batch.batch
+                    )
                 batch.f_ij = self._ensure_edge_frames(
                     batch, force=True, pos_override=centralized_node_pos
                 )

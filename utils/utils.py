@@ -307,17 +307,27 @@ def prepare_tensorboard(result_path):
 def prepare_optimizer(net, configs, num_train_samples, logging):
     optimizer, scheduler = load_opt(net, configs, logging)
     if scheduler is None:
-        whole_steps = np.ceil(
-            num_train_samples / configs.train_settings.grad_accumulation
-        ) * configs.train_settings.num_epochs / configs.optimizer.decay.num_restarts
-        first_cycle_steps = np.ceil(whole_steps / configs.optimizer.decay.num_restarts)
+        grad_accum = max(int(configs.train_settings.grad_accumulation), 1)
+        num_epochs = max(int(configs.train_settings.num_epochs), 1)
+        num_restarts = max(int(configs.optimizer.decay.num_restarts), 1)
+        steps_per_epoch = int(np.ceil(num_train_samples / grad_accum))
+        total_steps = max(steps_per_epoch * num_epochs, 1)
+        first_cycle_steps = max(int(np.ceil(total_steps / num_restarts)), 1)
+        warmup_steps = int(configs.optimizer.decay.warmup)
+        if warmup_steps >= first_cycle_steps:
+            adjusted_warmup_steps = max(first_cycle_steps - 1, 0)
+            logging.warning(
+                f"optimizer.decay.warmup ({warmup_steps}) >= first_cycle_steps ({first_cycle_steps}); "
+                f"clamping warmup to {adjusted_warmup_steps}."
+            )
+            warmup_steps = adjusted_warmup_steps
         scheduler = CosineAnnealingWarmupRestarts(
             optimizer,
             first_cycle_steps=first_cycle_steps,
             cycle_mult=1.0,
             max_lr=configs.optimizer.lr,
             min_lr=configs.optimizer.decay.min_lr,
-            warmup_steps=configs.optimizer.decay.warmup,
+            warmup_steps=warmup_steps,
             gamma=configs.optimizer.decay.gamma)
 
     return optimizer, scheduler
@@ -486,7 +496,16 @@ def prepare_saving_dir(configs, config_file_path):
 
 def load_encoder_decoder_configs(configs, result_path):
     if configs.model.encoder.name == 'gcpnet':
-        encoder_config_file_path = os.path.join('configs', 'config_gcpnet_encoder.yaml')
+        modality = (
+            getattr(configs.train_settings, "data_modality", None)
+            or getattr(configs.train_settings, "modality", None)
+            or getattr(configs, "data_modality", None)
+            or "protein"
+        )
+        if str(modality).lower() == "rna":
+            encoder_config_file_path = os.path.join('configs', 'config_gcpnet_encoder_rna.yaml')
+        else:
+            encoder_config_file_path = os.path.join('configs', 'config_gcpnet_encoder.yaml')
     else:
         raise ValueError('Unknown encoder')
 
@@ -527,6 +546,7 @@ def save_backbone_pdb(
         save_path_prefix,
         atom_names=("N", "CA", "C"),
         chain_id="A",
+        residue_sequences=None,
 ):
     """
     Write backbone (N, CA, C) atom coordinates to PDB files—one file per item in the batch—
@@ -557,6 +577,10 @@ def save_backbone_pdb(
     B, L = coords.shape[:2]
 
     for b in range(B):
+        residue_seq = None
+        if residue_sequences is not None:
+            residue_seq = residue_sequences[b] if isinstance(residue_sequences, (list, tuple)) else residue_sequences
+
         # Build output file name
         if save_path_prefix.lower().endswith(".pdb"):
             root = save_path_prefix[:-4]
@@ -571,12 +595,22 @@ def save_backbone_pdb(
                     continue
 
                 for a_idx, atom_name in enumerate(atom_names):
+                    atom_label = atom_name
+                    if atom_name == "N1/N9":
+                        base = residue_seq[r] if (residue_seq is not None and r < len(residue_seq)) else None
+                        if base in ("A", "G"):
+                            atom_label = "N9"
+                        elif base in ("C", "U"):
+                            atom_label = "N1"
+                        else:
+                            atom_label = "N"
+
                     # Check for NaN coordinates before writing
                     if not torch.isfinite(coords[b, r, a_idx]).all():
                         continue  # Skip this atom if any coordinate is NaN/inf
 
                     x, y, z = coords[b, r, a_idx].tolist()
-                    element = atom_name[0].upper()
+                    element = atom_label[0].upper()
 
                     # ┌────────────────────────────────────────── columns ──────────────────────────────────────────┐
                     #  1–6  "ATOM  "
@@ -601,7 +635,7 @@ def save_backbone_pdb(
                     fh.write(
                         f"ATOM  "
                         f"{serial:5d} "
-                        f"{atom_name:>4s}"
+                        f"{atom_label:>4s}"
                         f" "
                         f"UNK"
                         f" "
@@ -629,6 +663,7 @@ def save_backbone_pdb_inference(
         save_path_prefix,
         atom_names=("N", "CA", "C"),
         chain_id="A",
+        residue_sequence=None,
 ):
     """
     Save a single backbone PDB file without sample suffix.
@@ -645,6 +680,11 @@ def save_backbone_pdb_inference(
     B, L = coords.shape[:2]
 
     for b in range(B):
+        if isinstance(residue_sequence, (list, tuple)) and B > 1:
+            residue_seq = residue_sequence[b]
+        else:
+            residue_seq = residue_sequence
+
         # determine output path
         if save_path_prefix.lower().endswith('.pdb'):
             out_path = save_path_prefix
@@ -658,17 +698,27 @@ def save_backbone_pdb_inference(
                     continue
 
                 for a_idx, atom_name in enumerate(atom_names):
+                    atom_label = atom_name
+                    if atom_name == "N1/N9":
+                        base = residue_seq[r] if (residue_seq is not None and r < len(residue_seq)) else None
+                        if base in ("A", "G"):
+                            atom_label = "N9"
+                        elif base in ("C", "U"):
+                            atom_label = "N1"
+                        else:
+                            atom_label = "N"
+
                     # Check for NaN coordinates before writing
                     if not torch.isfinite(coords[b, r, a_idx]).all():
                         continue  # Skip this atom if any coordinate is NaN/inf
 
                     x, y, z = coords[b, r, a_idx].tolist()
-                    element = atom_name[0].upper()
+                    element = atom_label[0].upper()
 
                     fh.write(
                         f"ATOM  "
                         f"{serial:5d} "
-                        f"{atom_name:>4s}"
+                        f"{atom_label:>4s}"
                         f" "
                         f"UNK"
                         f" "
@@ -747,3 +797,4 @@ if __name__ == "__main__":
     atom_masks = torch.ones((n_samps, coordinates.shape[1]))
     save_backbone_pdb(coordinates, atom_masks, pdb_path)
     print(coordinates)
+

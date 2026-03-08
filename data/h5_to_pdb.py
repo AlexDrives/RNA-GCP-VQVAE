@@ -2,6 +2,7 @@ import argparse
 import os
 import glob
 import torch
+import h5py
 from tqdm import tqdm
 import sys
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -9,7 +10,7 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 # Add the parent directory to the Python path to allow imports from 'utils'
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
-from utils.utils import load_h5_file, save_backbone_pdb_inference
+from utils.utils import save_backbone_pdb_inference
 
 
 def find_h5_files(directory_path):
@@ -24,17 +25,32 @@ def find_h5_files(directory_path):
 def convert_h5_to_pdb(h5_path, pdb_dir):
     """Converts a single h5 file to a PDB file."""
     try:
-        seq, n_ca_c_o_coord, _ = load_h5_file(h5_path)
+        with h5py.File(h5_path, "r") as f:
+            seq_raw = f["seq"][()]
+            seq = seq_raw.decode("utf-8") if isinstance(seq_raw, (bytes, bytearray)) else str(seq_raw)
+            if "N_CA_C_O_coord" in f:
+                coords_np = f["N_CA_C_O_coord"][:, :3, :]
+                atom_names = ("N", "CA", "C")
+            elif "C4p_C1p_N_coord" in f:
+                coords_np = f["C4p_C1p_N_coord"][:]
+                atom_names = ("C4'", "C1'", "N1/N9")
+            else:
+                raise KeyError("No supported coordinate key found in H5 file.")
 
-        # We only need N, CA, C coordinates for the backbone PDB.
-        backbone_coords = torch.from_numpy(n_ca_c_o_coord[:, :3, :])
+        backbone_coords = torch.from_numpy(coords_np)
         # build mask: skip residues with any NaN coordinates
         mask = (~torch.isnan(backbone_coords).any(dim=(1, 2))).to(dtype=torch.int)
 
         base_name = os.path.splitext(os.path.basename(h5_path))[0]
         pdb_path = os.path.join(pdb_dir, f"{base_name}.pdb")
 
-        save_backbone_pdb_inference(backbone_coords, mask, pdb_path)
+        save_backbone_pdb_inference(
+            backbone_coords,
+            mask,
+            pdb_path,
+            atom_names=atom_names,
+            residue_sequence=seq,
+        )
         return True, h5_path, None
 
     except Exception as e:

@@ -1,6 +1,7 @@
 import glob
 import math
 import numpy as np
+import h5py
 import torch
 import torch_cluster
 import torch.nn.functional as F
@@ -22,20 +23,23 @@ BOND_LENGTHS = {
     "C-N": 1.329,
 }
 
+# RNA rigid-body atom names (third atom is N1/N9 depending on base type)
+RNA_ATOMS = ["C4'", "C1'", "N1/N9"]
+RNA_BASES = "AUCGX"
+
 
 def enforce_backbone_bonds(coords: torch.Tensor, changed: torch.Tensor = None) -> torch.Tensor:
     """
     Enforces ideal backbone bond lengths, selectively modifying specified atoms.
-
     This function iterates through a protein's coordinates and adjusts the positions
     of backbone atoms to match their ideal, physically-correct bond lengths (N-CA,
     CA-C, C-O, and the inter-residue C-N peptide bond).
-
+    只修改changed为True的原子    
     A key feature is its ability to selectively modify atoms. This is controlled by
     the `changed` mask, which ensures that only atoms marked as `True` (i.e., those
     that were part of an interpolated or otherwise modified region) are affected.
     This preserves the original coordinates of the known parts of the structure.
-
+    
     To handle cases where an atom's position is `NaN` at the start of the process,
     the function uses the vector from the previous two atoms in the backbone to
     determine a valid direction for placing the new atom. This makes the process
@@ -170,6 +174,55 @@ def merge_features_and_create_mask(features_list, max_length=512):
     return result, mask
 
 
+def load_rna_h5_file(file_path, return_backbone: bool = False):
+    with h5py.File(file_path, "r") as f:
+        seq = f["seq"][()]
+        coords = f["C4p_C1p_N_coord"][:]
+        plddt_scores = f["plddt_scores"][:] if "plddt_scores" in f else np.full((coords.shape[0],), np.nan)
+        backbone_coords = (
+            f["P_O5p_C5p_C4p_C3p_O3p_coord"][:]
+            if "P_O5p_C5p_C4p_C3p_O3p_coord" in f
+            else None
+        )
+    if return_backbone:
+        return seq, coords, plddt_scores, backbone_coords
+    return seq, coords, plddt_scores
+
+
+def _knn_graph_excluding_invalid(coords: torch.Tensor, batch: torch.Tensor, k: int) -> torch.Tensor:
+    """Build kNN edges while excluding nodes with non-finite anchor coordinates."""
+    device = coords.device
+    valid_mask = torch.isfinite(coords).all(dim=-1)
+    valid_idx = valid_mask.nonzero(as_tuple=False).view(-1)
+    if valid_idx.numel() <= 1:
+        return torch.empty((2, 0), dtype=torch.long, device=device)
+
+    coords_valid = coords[valid_idx]
+    batch_valid = batch[valid_idx]
+    if batch_valid.numel() == 0:
+        return torch.empty((2, 0), dtype=torch.long, device=device)
+
+    edge_indices = []
+    num_graphs = int(batch_valid.max().item()) + 1
+    for g in range(num_graphs):
+        local_idx = (batch_valid == g).nonzero(as_tuple=False).view(-1)
+        if local_idx.numel() <= 1:
+            continue
+        k_g = min(k, int(local_idx.numel()) - 1)
+        edge_local = torch_cluster.knn_graph(
+            coords_valid[local_idx],
+            k=k_g,
+            batch=None,
+            loop=False,
+        )
+        global_idx = valid_idx[local_idx]
+        edge_indices.append(global_idx[edge_local])
+
+    if not edge_indices:
+        return torch.empty((2, 0), dtype=torch.long, device=device)
+    return torch.cat(edge_indices, dim=1)
+
+
 def custom_collate_pretrained_gcp(one_batch, featuriser=None, task_transform=None, fill_value: float = 1e-5):
     # Unpack the batch
     torch_geometric_feature = [item[0] for item in one_batch]  # item[0] is for torch_geometric Data
@@ -256,6 +309,99 @@ def custom_collate_pretrained_gcp(one_batch, featuriser=None, task_transform=Non
     return one_batch
 
 
+def custom_collate_pretrained_gcp_rna(one_batch, featuriser=None, task_transform=None, fill_value: float = 1e-5):
+    # Unpack the batch
+    torch_geometric_feature = [item[0] for item in one_batch]
+
+    # Create a Batch object
+    torch_geometric_batch = Batch.from_data_list(torch_geometric_feature)
+
+    if not featuriser or not getattr(featuriser, "edge_types", None):
+        raise ValueError("Featuriser must supply kNN edge_types for precomputation.")
+
+    edge_types = featuriser.edge_types
+    if len(edge_types) != 1 or not edge_types[0].startswith("knn_"):
+        raise ValueError("Featuriser edge_types must contain a single 'knn_{k}' entry for precomputation.")
+
+    try:
+        k = int(edge_types[0].split("_", 1)[1])
+    except (IndexError, ValueError) as exc:
+        raise ValueError("Unable to parse k from edge_types; expected format 'knn_{k}'.") from exc
+
+    # Anchor on C1' (index 1) and exclude NaN anchors from kNN
+    c1p_coords = torch_geometric_batch.x_bb[:, 1].contiguous()
+    edge_index = _knn_graph_excluding_invalid(
+        c1p_coords, torch_geometric_batch.batch, k
+    )
+    torch_geometric_batch.edge_index = edge_index
+    torch_geometric_batch.edge_type = torch.zeros(
+        edge_index.size(1), dtype=torch.long, device=edge_index.device
+    )
+    torch_geometric_batch.edge_index_precomputed = True
+
+    raw_seqs = [item[1] for item in one_batch]
+    plddt_scores = [item[2] for item in one_batch]
+    pids = [item[3] for item in one_batch]
+
+    coords = torch.stack([item[4] for item in one_batch])
+    masks = torch.stack([item[5] for item in one_batch])
+
+    input_coordinates = torch.stack([item[6] for item in one_batch])
+    inverse_folding_labels = torch.stack([item[7] for item in one_batch])
+
+    nan_mask = torch.stack([item[8] for item in one_batch])
+    sample_weights = torch.tensor([item[9] for item in one_batch], dtype=torch.float32)
+
+    plddt_scores = torch.cat(plddt_scores, dim=0)
+    one_batch = {
+        "graph": torch_geometric_batch,
+        "seq": raw_seqs,
+        "plddt": plddt_scores,
+        "pid": pids,
+        "target_coords": coords,
+        "masks": masks,
+        "nan_masks": nan_mask,
+        "input_coordinates": input_coordinates,
+        "inverse_folding_labels": inverse_folding_labels,
+        "sample_weights": sample_weights,
+    }
+
+    # build input graph one_batch to be featurized
+    device = one_batch["graph"].x.device
+
+    one_batch["graph"].fill_value = torch.full((one_batch["graph"].num_graphs,), fill_value, device=device)
+
+    one_batch["graph"].atom_list = [RNA_ATOMS for _ in range(one_batch["graph"].num_graphs)]
+    one_batch["graph"].id = one_batch["pid"]
+
+    one_batch["graph"].residue_id = [
+        [f"A:{res}:{res_index}" for res_index, res in enumerate(seq, start=1)] for seq in one_batch["seq"]
+    ]
+    one_batch["graph"].residue_type = torch.cat(
+        [torch.tensor([RNA_BASES.index(res) if res in RNA_BASES else RNA_BASES.index("X")
+                       for res in seq], device=device) for seq in one_batch["seq"]]
+    )
+    one_batch["graph"].residues = [[res for res in seq] for seq in one_batch["seq"]]
+    one_batch["graph"].chains = torch.zeros_like(one_batch["graph"].batch, device=device)
+
+    # Preserve NaNs in RNA coordinates (no fill_value replacement)
+    one_batch["graph"].coords = one_batch["graph"].x_bb.float()
+    one_batch["graph"]._slice_dict["coords"] = one_batch["graph"]._slice_dict["x_bb"]
+
+    one_batch["graph"].seq_pos = torch.cat([
+        torch.arange(len(seq), device=device).unsqueeze(1) for seq in one_batch["seq"]
+    ])
+
+    if featuriser:
+        # Apply the featuriser to the collated graph batch
+        one_batch["graph"] = featuriser(one_batch["graph"])
+        # Apply the task transform if it exists
+        if task_transform:
+            one_batch["graph"] = task_transform(one_batch["graph"])
+
+    return one_batch
+
+
 def _normalize(tensor, dim=-1, eps=1e-8):
     """
     Normalizes a `torch.Tensor` along dimension `dim` without `nan`s.
@@ -315,6 +461,32 @@ def amino_acid_to_tensor(sequence, max_length):
     return tensor
 
 
+def rna_base_to_tensor(sequence, max_length):
+    """
+    Converts an RNA base sequence to a categorical PyTorch tensor with padding or trimming.
+
+    Args:
+        sequence (str): The RNA sequence (e.g., "AUCGAU").
+        max_length (int): The desired fixed length for the sequence.
+
+    Returns:
+        torch.Tensor: A tensor of shape (1, max_length) representing the sequence.
+    """
+    bases = RNA_BASES  # "AUCGX"
+    base_to_index = {b: i + 1 for i, b in enumerate(bases)}
+    pad_index = 0
+
+    encoded = [base_to_index.get(b, pad_index) for b in sequence]
+
+    if len(encoded) < max_length:
+        encoded = encoded + [pad_index] * (max_length - len(encoded))
+    else:
+        encoded = encoded[:max_length]
+
+    tensor = torch.tensor(encoded, dtype=torch.long)
+    return tensor
+
+
 class GCPNetDataset(Dataset):
     """
     This class is a subclass of `torch.utils.data.Dataset` and is used to transform JSON/dictionary-style
@@ -341,7 +513,7 @@ class GCPNetDataset(Dataset):
     - device: The device to use for preprocessing. If "cuda", preprocessing will be done on the GPU.
     """
 
-    def __init__(self, data_path,
+    def __init__(self, data_path,  # 数据路径，用于指定数据集所在的位置
                  num_positional_embeddings=16, top_k=30, **kwargs
                  ):
         super(GCPNetDataset, self).__init__()
@@ -645,7 +817,18 @@ class GCPNetDataset(Dataset):
         else:
             return out_tensor.tolist()
 
-    def _apply_augmentations(self, coords_list, raw_sequence):
+    @staticmethod
+    def _estimate_residue_missing_ratio(coords_list) -> float:
+        if not coords_list:
+            return 1.0
+        coords_tensor = torch.as_tensor(coords_list, dtype=torch.float32)
+        if coords_tensor.ndim != 3:
+            return 1.0
+        residue_valid = torch.isfinite(coords_tensor).all(dim=-1).all(dim=-1)
+        missing_ratio = 1.0 - residue_valid.float().mean().item()
+        return float(min(max(missing_ratio, 0.0), 1.0))
+
+    def _apply_augmentations(self, coords_list, raw_sequence, aux_coords_list=None):
         """
         Applies a series of augmentations to the input coordinates and sequence.
 
@@ -654,21 +837,50 @@ class GCPNetDataset(Dataset):
           2. Random Cutoff: Truncate sequence + coordinates to a random length.
 
         Args:
-            coords_list (list): Nested list of backbone coords shape (L, 4, 3) for [N, CA, C, O].
+            coords_list (list): Nested list of backbone coords shape (L, n_atoms, 3).
             raw_sequence (str): Amino acid sequence.
+            aux_coords_list (list, optional): Auxiliary residue coordinates to be masked/cut
+                in sync with ``coords_list``.
         Returns:
-            (new_coords_list, new_sequence_str)
+            (new_coords_list, new_sequence_str, new_aux_coords_list)
         """
         nan_cfg = self.configs.train_settings.nan_augmentation
         cut_cfg = self.configs.train_settings.cutoff_augmentation
 
         seq_list = list(raw_sequence)
 
+        effective_probability = float(getattr(nan_cfg, "probability", 0.0))
+        effective_max_length = max(1, int(getattr(nan_cfg, "max_length", 1)))
+
+        adaptive_cfg = getattr(nan_cfg, "adaptive_missing", None)
+        adaptive_enabled = True
+        max_missing_ratio = 0.30
+        min_scale = 0.20
+        if adaptive_cfg is not None:
+            if isinstance(adaptive_cfg, Mapping):
+                adaptive_enabled = bool(adaptive_cfg.get("enabled", True))
+                max_missing_ratio = float(adaptive_cfg.get("max_missing_ratio", max_missing_ratio))
+                min_scale = float(adaptive_cfg.get("min_scale", min_scale))
+            else:
+                adaptive_enabled = bool(getattr(adaptive_cfg, "enabled", True))
+                max_missing_ratio = float(getattr(adaptive_cfg, "max_missing_ratio", max_missing_ratio))
+                min_scale = float(getattr(adaptive_cfg, "min_scale", min_scale))
+
+        if adaptive_enabled:
+            missing_ratio = self._estimate_residue_missing_ratio(coords_list)
+            ratio_ref = max(max_missing_ratio, 1e-6)
+            scale = 1.0 - (missing_ratio / ratio_ref)
+            scale = min(max(scale, min_scale), 1.0)
+            effective_probability = effective_probability * scale
+            effective_max_length = max(1, int(round(effective_max_length * scale)))
+
         # random nan masking
-        if nan_cfg.enabled and self.mode == 'train' and random.random() < nan_cfg.probability:
-            segment_length = random.randint(1, nan_cfg.max_length)
+        num_atoms = len(coords_list[0]) if coords_list else 0
+        aux_num_atoms = len(aux_coords_list[0]) if aux_coords_list else 0
+        if nan_cfg.enabled and self.mode == 'train' and random.random() < effective_probability:
             N = len(coords_list)
-            if N > segment_length:
+            if N > 0:
+                segment_length = random.randint(1, min(effective_max_length, N))
                 # choose 1..6 chunks, but not more than the segment_length
                 num_chunks = random.randint(1, min(6, segment_length))
 
@@ -702,7 +914,9 @@ class GCPNetDataset(Dataset):
                 # apply masking
                 for s, e in masked_ranges:
                     for idx in range(s, e):
-                        coords_list[idx] = [[float('nan')] * 3 for _ in range(4)]
+                        coords_list[idx] = [[float('nan')] * 3 for _ in range(num_atoms)]
+                        if aux_coords_list is not None and idx < len(aux_coords_list):
+                            aux_coords_list[idx] = [[float("nan")] * 3 for _ in range(aux_num_atoms)]
                         if idx < len(seq_list):
                             seq_list[idx] = 'X'
 
@@ -715,8 +929,10 @@ class GCPNetDataset(Dataset):
                 random_length = random.randint(min_len, max_len)
                 coords_list = coords_list[:random_length]
                 seq_list = seq_list[:random_length]
+                if aux_coords_list is not None:
+                    aux_coords_list = aux_coords_list[:random_length]
 
-        return coords_list, "".join(seq_list)
+        return coords_list, "".join(seq_list), aux_coords_list
 
     def _calculate_sample_weight(self, sequence_length):
         """
@@ -756,30 +972,42 @@ class GCPNetDataset(Dataset):
         return min(weight, max_weight)
 
     def __getitem__(self, i):
-        sample_path = self.h5_samples[i]
-        sample = load_h5_file(sample_path)
-        basename = os.path.basename(sample_path)
-        pid = basename.split('.h5')[0]
+        attempts = 0
+        while True:
+            sample_path = self.h5_samples[i]
+            seq, coords, plddt_scores = load_rna_h5_file(sample_path)
+            basename = os.path.basename(sample_path)
+            pid = basename.split(".h5")[0]
 
-        # Decode sequence and replace U with X
-        raw_sequence = sample[0].decode('utf-8').replace('U', 'X').replace('O', 'X').replace('B', 'X').replace('Z', 'X')
-        
-        coords_list = torch.tensor(sample[1].tolist()).tolist()
+            raw_sequence = seq.decode("utf-8") if isinstance(seq, (bytes, bytearray)) else str(seq)
+            coords_list = torch.tensor(coords, dtype=torch.float32).tolist()
 
-        # NEW: global random rotation BEFORE other augmentations
-        coords_list = self._apply_random_rotation(coords_list)
+            # global random rotation BEFORE other augmentations
+            coords_list = self._apply_random_rotation(coords_list)
 
-        if self.mode == 'train' and (self.configs.train_settings.nan_augmentation.enabled or
-                                     self.configs.train_settings.cutoff_augmentation.enabled):
-            coords_list, raw_sequence = self._apply_augmentations(coords_list, raw_sequence)
+            if self.mode == "train" and (self.configs.train_settings.nan_augmentation.enabled or
+                                         self.configs.train_settings.cutoff_augmentation.enabled):
+                coords_list, raw_sequence, _ = self._apply_augmentations(coords_list, raw_sequence)
 
-        coords_list, nan_mask = self.handle_nan_coordinates(torch.tensor(coords_list))
+            coords_list, nan_mask = self.handle_nan_coordinates(torch.tensor(coords_list, dtype=torch.float32))
 
-        # Pad or trim nan_mask to max_length and invert it to correctly represent missing coordinates
-        nan_mask = torch.cat([nan_mask, nan_mask.new_zeros(self.max_length)], dim=0)[:self.max_length]
+            # Pad or trim nan_mask to max_length
+            nan_mask = torch.cat([nan_mask, nan_mask.new_zeros(self.max_length)], dim=0)[:self.max_length]
 
-        coords_list = self.recenter_coordinates(coords_list).tolist()
+            if nan_mask.any():
+                coords_list = self.recenter_coordinates(coords_list).tolist()
+                break
 
+            # Resample when all residues are invalid (prevents NaN losses downstream)
+            attempts += 1
+            if attempts >= 10:
+                raise RuntimeError(
+                    f"No valid RNA residues after {attempts} attempts; last file: {sample_path}"
+                )
+            if self.mode == "train":
+                i = random.randint(0, len(self.h5_samples) - 1)
+            else:
+                i = (i + 1) % len(self.h5_samples)
         sample_dict = {'name': pid,
                        'coords': coords_list,
                        'seq': raw_sequence}
@@ -808,7 +1036,8 @@ class GCPNetDataset(Dataset):
         coords = coords.squeeze(0)
         masks = masks.squeeze(0)
 
-        # Calculate sample weight based on sequence length
+        # Calculate sample weight based on sequence
+        #  length
         sequence_length = len(raw_sequence)
         sample_weight = self._calculate_sample_weight(sequence_length)
 
@@ -910,6 +1139,235 @@ class GCPNetDataset(Dataset):
         return vec
 
 
+class GCPNetRNADataset(GCPNetDataset):
+    """
+    Dataset for RNA rigid-body representation with atoms [C4', C1', N1/N9].
+
+    Missing coordinates are preserved as NaN; no interpolation or geometric
+    imputation is performed.
+    """
+
+    def __init__(
+        self,
+        data_path,
+        num_positional_embeddings=16,
+        top_k=30,
+        **kwargs,
+    ):
+        self.h5_samples = glob.glob(os.path.join(data_path, "**", "*.h5"), recursive=True)
+
+        self.mode = kwargs["mode"]
+
+        if self.mode == "train":
+            random.shuffle(self.h5_samples)
+
+        self.h5_samples = self.h5_samples[:kwargs["configs"].train_settings.max_task_samples]
+
+        self.top_k = top_k
+        self.num_positional_embeddings = num_positional_embeddings
+
+        self.letter_to_num = {b: i for i, b in enumerate(RNA_BASES)}
+        self.num_to_letter = {v: k for k, v in self.letter_to_num.items()}
+
+        self.max_length = kwargs["configs"].model.max_length
+        self.configs = kwargs["configs"]
+
+        encoder_cfg_path = os.path.join("configs", "config_gcpnet_encoder_rna.yaml")
+        encoder_cfg = load_encoder_config(encoder_cfg_path)
+        self.pretrained_featuriser = instantiate_module(encoder_cfg.get("features"))
+
+        task_cfg = encoder_cfg.get("task")
+        self.pretrained_task_transform = (
+            instantiate_module(task_cfg.get("transform"))
+            if isinstance(task_cfg, Mapping)
+            else None
+        )
+
+    @staticmethod
+    def handle_nan_coordinates(coords: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Preserve NaNs and return a validity mask.
+
+        Returns:
+            - coords unchanged
+            - mask (N,) where True indicates all three atoms are finite.
+        """
+        valid = torch.isfinite(coords).all(dim=-1).all(dim=1)
+        return coords, valid
+
+    @staticmethod
+    def recenter_coordinates(coordinates: torch.Tensor) -> torch.Tensor:
+        """Nan-safe recentering over finite coordinates only."""
+        coords = coordinates.clone()
+        flat = coords.view(-1, 3)
+        finite = torch.isfinite(flat).all(dim=-1)
+        if not finite.any():
+            return coords
+        center = flat[finite].mean(dim=0)
+        return coords - center
+
+    def _apply_gaussian_jitter(self, coords_list):
+        """Disable protein-specific jitter/geometry enforcement for RNA."""
+        return coords_list
+
+    def __len__(self):
+        return len(self.h5_samples)
+
+    def __getitem__(self, i):
+        attempts = 0
+        while True:
+            sample_path = self.h5_samples[i]
+            seq, coords, plddt_scores, backbone_coords = load_rna_h5_file(
+                sample_path, return_backbone=True
+            )
+            basename = os.path.basename(sample_path)
+            pid = basename.split(".h5")[0]
+
+            raw_sequence = seq.decode("utf-8") if isinstance(seq, (bytes, bytearray)) else str(seq)
+            coords_list = torch.tensor(coords, dtype=torch.float32).tolist()
+            if backbone_coords is None:
+                backbone_coords_tensor = torch.full(
+                    (len(coords_list), 6, 3), float("nan"), dtype=torch.float32
+                )
+            else:
+                backbone_coords_tensor = torch.as_tensor(backbone_coords, dtype=torch.float32)
+                if (
+                    backbone_coords_tensor.ndim != 3
+                    or backbone_coords_tensor.size(1) != 6
+                    or backbone_coords_tensor.size(2) != 3
+                ):
+                    backbone_coords_tensor = torch.full(
+                        (len(coords_list), 6, 3), float("nan"), dtype=torch.float32
+                    )
+                elif backbone_coords_tensor.size(0) != len(coords_list):
+                    target_len = len(coords_list)
+                    fixed = torch.full((target_len, 6, 3), float("nan"), dtype=torch.float32)
+                    copy_len = min(target_len, int(backbone_coords_tensor.size(0)))
+                    if copy_len > 0:
+                        fixed[:copy_len] = backbone_coords_tensor[:copy_len]
+                    backbone_coords_tensor = fixed
+            backbone_coords_list = backbone_coords_tensor.tolist()
+
+            # global random rotation BEFORE other augmentations
+            coords_list = self._apply_random_rotation(coords_list)
+
+            if self.mode == "train" and (self.configs.train_settings.nan_augmentation.enabled or
+                                         self.configs.train_settings.cutoff_augmentation.enabled):
+                coords_list, raw_sequence, backbone_coords_list = self._apply_augmentations(
+                    coords_list,
+                    raw_sequence,
+                    backbone_coords_list,
+                )
+
+            coords_list, nan_mask = self.handle_nan_coordinates(torch.tensor(coords_list, dtype=torch.float32))
+
+            # Pad or trim nan_mask to max_length
+            nan_mask = torch.cat([nan_mask, nan_mask.new_zeros(self.max_length)], dim=0)[:self.max_length]
+
+            if nan_mask.any():
+                coords_list = self.recenter_coordinates(coords_list).tolist()
+                break
+
+            # Resample when all residues are invalid (prevents NaN losses downstream)
+            attempts += 1
+            if attempts >= 10:
+                raise RuntimeError(
+                    f"No valid RNA residues after {attempts} attempts; last file: {sample_path}"
+                )
+            if self.mode == "train":
+                i = random.randint(0, len(self.h5_samples) - 1)
+            else:
+                i = (i + 1) % len(self.h5_samples)
+        sample_dict = {
+            "name": pid,
+            "coords": coords_list,
+            "seq": raw_sequence,
+            "rna_backbone_coords": backbone_coords_list,
+        }
+        inverse_folding_labels = rna_base_to_tensor(raw_sequence, self.max_length)
+
+        feature = self._featurize_as_graph(sample_dict)
+        plddt_scores = torch.from_numpy(plddt_scores).to(torch.float16)
+        raw_seqs = raw_sequence
+        coords_list = sample_dict["coords"]
+        coords_tensor = torch.tensor(coords_list, dtype=torch.float32)
+
+        coords_tensor = coords_tensor[:self.max_length, ...]
+        coords_tensor = coords_tensor.reshape(1, -1, 9)
+
+        coords, masks = merge_features_and_create_mask(coords_tensor, self.max_length)
+        input_coordinates = coords.clone()
+
+        # squeeze coords and masks to return them to 2D
+        coords = coords.squeeze(0)
+        masks = masks.squeeze(0)
+
+        sequence_length = len(raw_sequence)
+        sample_weight = self._calculate_sample_weight(sequence_length)
+
+        return [
+            feature,
+            raw_seqs,
+            plddt_scores,
+            pid,
+            coords,
+            masks,
+            input_coordinates,
+            inverse_folding_labels,
+            nan_mask,
+            sample_weight,
+        ]
+
+    def _featurize_as_graph(self, rna):
+        from torch_geometric.data import Data
+
+        name = rna["name"]
+        with torch.no_grad():
+            coords = torch.as_tensor(rna["coords"], dtype=torch.float32)
+            rna_backbone_coords = rna.get("rna_backbone_coords", None)
+            if rna_backbone_coords is None:
+                backbone = torch.full((coords.size(0), 6, 3), float("nan"), dtype=torch.float32)
+            else:
+                backbone = torch.as_tensor(rna_backbone_coords, dtype=torch.float32)
+                if backbone.ndim != 3 or backbone.size(1) != 6 or backbone.size(2) != 3:
+                    backbone = torch.full((coords.size(0), 6, 3), float("nan"), dtype=torch.float32)
+                elif backbone.size(0) != coords.size(0):
+                    fixed = torch.full((coords.size(0), 6, 3), float("nan"), dtype=torch.float32)
+                    copy_len = min(coords.size(0), int(backbone.size(0)))
+                    if copy_len > 0:
+                        fixed[:copy_len] = backbone[:copy_len]
+                    backbone = fixed
+            seq = torch.as_tensor(
+                [self.letter_to_num.get(a, self.letter_to_num["X"]) for a in rna["seq"]],
+                dtype=torch.long,
+            )
+
+            mask = torch.isfinite(coords.sum(dim=(1, 2)))
+            # Preserve NaNs in coords for downstream NaN-aware masking
+
+            X_c1p = coords[:, 1]
+
+        data = Data(
+            x=X_c1p,
+            x_bb=coords,
+            seq=seq,
+            name=name,
+            mask=mask,
+            rna_backbone_coords=backbone,
+        )
+        return data
+
+
+def _resolve_modality(configs) -> str:
+    modality = (
+        getattr(configs.train_settings, "data_modality", None)
+        or getattr(configs.train_settings, "modality", None)
+        or getattr(configs, "data_modality", None)
+        or "protein"
+    )
+    return str(modality).lower()
+
+
 def prepare_gcpnet_vqvae_dataloaders(logging, accelerator, configs, **kwargs):
     if accelerator.is_main_process:
         logging.info(f"train directory: {configs.train_settings.data_path}")
@@ -922,7 +1380,15 @@ def prepare_gcpnet_vqvae_dataloaders(logging, accelerator, configs, **kwargs):
             f"Data path {configs.valid_settings.data_path} does not exist"
         )
 
-    train_dataset = GCPNetDataset(
+    modality = _resolve_modality(configs)
+    if modality == "rna":
+        dataset_cls = GCPNetRNADataset
+        collate_fn = custom_collate_pretrained_gcp_rna
+    else:
+        dataset_cls = GCPNetDataset
+        collate_fn = custom_collate_pretrained_gcp
+
+    train_dataset = dataset_cls(
         configs.train_settings.data_path,
         top_k=kwargs["encoder_configs"].top_k,
         num_positional_embeddings=kwargs["encoder_configs"].num_positional_embeddings,
@@ -930,7 +1396,7 @@ def prepare_gcpnet_vqvae_dataloaders(logging, accelerator, configs, **kwargs):
         mode="train",
     )
 
-    valid_dataset = GCPNetDataset(
+    valid_dataset = dataset_cls(
         configs.valid_settings.data_path,
         top_k=kwargs["encoder_configs"].top_k,
         num_positional_embeddings=kwargs["encoder_configs"].num_positional_embeddings,
@@ -938,8 +1404,23 @@ def prepare_gcpnet_vqvae_dataloaders(logging, accelerator, configs, **kwargs):
         mode="evaluation",
     )
 
+    train_size = len(train_dataset)
+    valid_size = len(valid_dataset)
+    if accelerator.is_main_process:
+        logging.info(f"train samples discovered: {train_size}")
+        logging.info(f"valid samples discovered: {valid_size}")
+
+    if train_size == 0 or valid_size == 0:
+        raise RuntimeError(
+            "No .h5 samples found for training/validation. "
+            f"train={train_size} at {configs.train_settings.data_path}, "
+            f"valid={valid_size} at {configs.valid_settings.data_path}. "
+            "This trainer expects split directories containing .h5 files "
+            "(not raw .pdb/.cif symlinks)."
+        )
+
     custom_collate_pretrained_gcp_partial = functools.partial(
-        custom_collate_pretrained_gcp,
+        collate_fn,
         featuriser=train_dataset.pretrained_featuriser,
         task_transform=train_dataset.pretrained_task_transform,
     )
@@ -1013,3 +1494,4 @@ if __name__ == '__main__':
     for batch in tqdm.tqdm(test_loader, total=len(test_loader)):
         # graph = batch["graph"]
         pass
+

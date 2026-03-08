@@ -6,6 +6,16 @@ from typing import Optional, Dict, Any
 import torch._functorch.config as functorch_config
 
 
+def _resolve_data_modality(configs) -> str:
+    modality = (
+        getattr(configs.train_settings, "data_modality", None)
+        or getattr(configs.train_settings, "modality", None)
+        or getattr(configs, "data_modality", None)
+        or "protein"
+    )
+    return str(modality).lower()
+
+
 def compute_grad_norm(loss, parameters, norm_type=2):
     """
     Compute the gradient norm for a given loss and model parameters without altering existing gradients.
@@ -354,6 +364,11 @@ def calculate_aligned_mse_loss(x_predicted, x_true, masks, alignment_strategy):
         x_pred = x_predicted[i]  # [seq_len, num_atoms, 3]
         x_tru = x_true[i]  # [seq_len, num_atoms, 3]
 
+        if not mask.any():
+            x_true_aligned_list.append(x_tru.detach())
+            loss_list.append(torch.tensor(0.0, device=x_predicted.device))
+            continue
+
         with torch.no_grad():
             if alignment_strategy == 'kabsch':
                 # Extract valid residues (each with multiple atoms) based on mask
@@ -405,6 +420,10 @@ def calculate_backbone_distance_loss(x_predicted, x_true, masks):
 
     for i in range(batch_size):
         mask = masks[i].bool()  # Convert to boolean mask
+        if not mask.any():
+            loss_list.append(torch.tensor(0.0, device=x_predicted.device))
+            continue
+
         x_pred = x_predicted[i][mask]  # [num_valid, num_atoms, 3]
         x_tru = x_true[i][mask]
 
@@ -465,7 +484,22 @@ def compute_vectors(coords):
     return vectors
 
 
-def calculate_backbone_direction_loss(x_predicted, x_true, masks):
+def compute_rna_vectors(coords):
+    """
+    Computes RNA rigid-body vectors from [C4', C1', N1/N9] atoms.
+
+    Returns:
+        torch.Tensor: Concatenated vectors of shape (3 * num_points, 3)
+            [C1->N, C1->C4, normal].
+    """
+    c1_to_n = coords[:, 2, :] - coords[:, 1, :]
+    c1_to_c4 = coords[:, 0, :] - coords[:, 1, :]
+    normal = torch.cross(c1_to_n, c1_to_c4, dim=-1)
+    vectors = torch.cat([c1_to_n, c1_to_c4, normal], dim=0)
+    return vectors
+
+
+def calculate_backbone_direction_loss(x_predicted, x_true, masks, modality: str = "protein"):
     """
     Calculates the backbone direction loss between x_predicted and x_true after applying masks.
 
@@ -482,12 +516,20 @@ def calculate_backbone_direction_loss(x_predicted, x_true, masks):
 
     for i in range(batch_size):
         mask = masks[i].bool()  # Convert to boolean mask
+        if not mask.any():
+            loss_list.append(torch.tensor(0.0, device=x_predicted.device))
+            continue
+
         x_pred = x_predicted[i][mask]  # [num_valid, num_atoms, 3]
         x_tru = x_true[i][mask]
 
         # Compute vectors for predicted and true coordinates
-        V_pred = compute_vectors(x_pred)
-        V_true = compute_vectors(x_tru)
+        if modality == "rna":
+            V_pred = compute_rna_vectors(x_pred)
+            V_true = compute_rna_vectors(x_tru)
+        else:
+            V_pred = compute_vectors(x_pred)
+            V_true = compute_vectors(x_tru)
 
         # Compute pairwise dot products
         D_pred = torch.matmul(V_pred, V_pred.transpose(0, 1))
@@ -505,8 +547,7 @@ def calculate_backbone_direction_loss(x_predicted, x_true, masks):
 
     return torch.stack(loss_list)
 
-
-def calculate_binned_direction_classification_loss(dir_loss_logits, x_true, masks):
+def calculate_binned_direction_classification_loss(dir_loss_logits, x_true, masks, modality: str = "protein"):
     """
     Calculates the binned direction classification loss.
 
@@ -525,24 +566,33 @@ def calculate_binned_direction_classification_loss(dir_loss_logits, x_true, mask
         mask = masks[i].bool()  # Convert to boolean mask
         x_tru = x_true[i][mask]  # [num_valid, num_atoms, 3]
 
-        # Compute vectors for true coordinates
-        CA_to_C = x_tru[:, 2, :] - x_tru[:, 1, :]
-        CA_to_N = x_tru[:, 0, :] - x_tru[:, 1, :]
-        nCA = torch.cross(CA_to_C, CA_to_N, dim=-1)
+        if modality == "rna":
+            # RNA vectors from [C4', C1', N1/N9]
+            vec_a = x_tru[:, 2, :] - x_tru[:, 1, :]  # C1 -> N
+            vec_b = x_tru[:, 0, :] - x_tru[:, 1, :]  # C1 -> C4
+            vec_n = torch.cross(vec_a, vec_b, dim=-1)
 
-        # Normalize vectors to unit length
-        CA_to_C = F.normalize(CA_to_C, dim=-1)
-        CA_to_N = F.normalize(CA_to_N, dim=-1)
-        nCA = F.normalize(nCA, dim=-1)
+            vec_a = F.normalize(vec_a, dim=-1)
+            vec_b = F.normalize(vec_b, dim=-1)
+            vec_n = F.normalize(vec_n, dim=-1)
+        else:
+            # Protein vectors from [N, CA, C]
+            vec_b = x_tru[:, 2, :] - x_tru[:, 1, :]  # CA -> C
+            vec_a = x_tru[:, 0, :] - x_tru[:, 1, :]  # CA -> N
+            vec_n = torch.cross(vec_b, vec_a, dim=-1)
+
+            vec_b = F.normalize(vec_b, dim=-1)
+            vec_a = F.normalize(vec_a, dim=-1)
+            vec_n = F.normalize(vec_n, dim=-1)
 
         # Compute pairwise dot products
         dot_products = torch.stack([
-            torch.matmul(CA_to_N, CA_to_N.transpose(0, 1)),
-            torch.matmul(CA_to_N, CA_to_C.transpose(0, 1)),
-            torch.matmul(CA_to_N, nCA.transpose(0, 1)),
-            torch.matmul(CA_to_C, CA_to_C.transpose(0, 1)),
-            torch.matmul(CA_to_C, nCA.transpose(0, 1)),
-            torch.matmul(nCA, nCA.transpose(0, 1))
+            torch.matmul(vec_a, vec_a.transpose(0, 1)),
+            torch.matmul(vec_a, vec_b.transpose(0, 1)),
+            torch.matmul(vec_a, vec_n.transpose(0, 1)),
+            torch.matmul(vec_b, vec_b.transpose(0, 1)),
+            torch.matmul(vec_b, vec_n.transpose(0, 1)),
+            torch.matmul(vec_n, vec_n.transpose(0, 1))
         ], dim=-1)  # Shape: [num_valid, num_valid, 6]
 
         # Bin the dot products into 16 bins
@@ -558,7 +608,7 @@ def calculate_binned_direction_classification_loss(dir_loss_logits, x_true, mask
     return torch.stack(loss_list)
 
 
-def calculate_binned_distance_classification_loss(dist_loss_logits, x_true, masks):
+def calculate_binned_distance_classification_loss(dist_loss_logits, x_true, masks, modality: str = "protein"):
     """
     Calculates the binned distance classification loss.
 
@@ -580,19 +630,24 @@ def calculate_binned_distance_classification_loss(dist_loss_logits, x_true, mask
         mask = masks[i].bool()  # Convert to boolean mask
         x_tru = x_true[i][mask]  # [num_valid, num_atoms, 3]
 
-        # Compute Cβ coordinates
-        N_to_CA = x_tru[:, 1, :] - x_tru[:, 0, :]
-        CA_to_C = x_tru[:, 2, :] - x_tru[:, 1, :]
-        n = torch.cross(N_to_CA, CA_to_C, dim=-1)
+        if modality == "rna":
+            # Use anchor C1' distance labels for RNA rigid-body reconstruction.
+            anchors = x_tru[:, 1, :]
+            pairwise_distances = torch.cdist(anchors, anchors, p=2) ** 2
+        else:
+            # Compute Cβ coordinates for protein.
+            N_to_CA = x_tru[:, 1, :] - x_tru[:, 0, :]
+            CA_to_C = x_tru[:, 2, :] - x_tru[:, 1, :]
+            n = torch.cross(N_to_CA, CA_to_C, dim=-1)
 
-        a = -0.58273431
-        b = 0.56802827
-        c = -0.54067466
+            a = -0.58273431
+            b = 0.56802827
+            c = -0.54067466
 
-        C_beta = a * n + b * N_to_CA + c * CA_to_C + x_tru[:, 1, :]
+            C_beta = a * n + b * N_to_CA + c * CA_to_C + x_tru[:, 1, :]
 
-        # Compute pairwise distances
-        pairwise_distances = torch.cdist(C_beta, C_beta, p=2) ** 2
+            # Compute pairwise distances
+            pairwise_distances = torch.cdist(C_beta, C_beta, p=2) ** 2
 
         # Bin the distances into 64 bins
         labels = torch.bucketize(pairwise_distances, bin_edges)  # Shape: [num_valid, num_valid]
@@ -709,6 +764,7 @@ def calculate_decoder_loss(output_dict: Dict[str, torch.Tensor],
     if alignment_strategy is None:
         alignment_strategy = configs.train_settings.losses.alignment_strategy
 
+    data_modality = _resolve_data_modality(configs)
     labels = data['target_coords']
     masks = torch.logical_and(data['masks'], data['nan_masks']).float()
 
@@ -773,7 +829,7 @@ def calculate_decoder_loss(output_dict: Dict[str, torch.Tensor],
         w = configs.train_settings.losses.backbone_direction.weight
         backbone_direction_coeff = adaptive.get('backbone_direction', 1.0)
         bdir_unscaled = calculate_backbone_direction_loss(
-            x_pred_aligned, x_true_aligned, masks).mean()
+            x_pred_aligned, x_true_aligned, masks, modality=data_modality).mean()
         loss_dict['unscaled_backbone_direction_loss'] = bdir_unscaled
         loss_dict['backbone_direction_loss'] = bdir_unscaled * w * backbone_direction_coeff
     else:
@@ -785,8 +841,8 @@ def calculate_decoder_loss(output_dict: Dict[str, torch.Tensor],
         w = configs.train_settings.losses.binned_direction_classification.weight
         binned_direction_coeff = adaptive.get('binned_direction_classification', 1.0)
         val_unscaled = calculate_binned_direction_classification_loss(
-            dir_loss_logits, x_true_aligned, masks).mean() if dir_loss_logits is not None else torch.tensor(0.0,
-                                                                                                            device=device)
+            dir_loss_logits, x_true_aligned, masks, modality=data_modality
+        ).mean() if dir_loss_logits is not None else torch.tensor(0.0, device=device)
         loss_dict['unscaled_binned_direction_classification_loss'] = val_unscaled
         loss_dict['binned_direction_classification_loss'] = val_unscaled * w * binned_direction_coeff
     else:
@@ -798,8 +854,8 @@ def calculate_decoder_loss(output_dict: Dict[str, torch.Tensor],
         w = configs.train_settings.losses.binned_distance_classification.weight
         binned_distance_coeff = adaptive.get('binned_distance_classification', 1.0)
         val_unscaled = calculate_binned_distance_classification_loss(
-            dist_loss_logits, x_true_aligned, masks).mean() if dist_loss_logits is not None else torch.tensor(0.0,
-                                                                                                              device=device)
+            dist_loss_logits, x_true_aligned, masks, modality=data_modality
+        ).mean() if dist_loss_logits is not None else torch.tensor(0.0, device=device)
         loss_dict['unscaled_binned_distance_classification_loss'] = val_unscaled
         loss_dict['binned_distance_classification_loss'] = val_unscaled * w * binned_distance_coeff
     else:
@@ -860,3 +916,8 @@ def calculate_decoder_loss(output_dict: Dict[str, torch.Tensor],
     loss_dict['step_loss'] = loss_dict['rec_loss'] + loss_dict['vq_loss'] + loss_dict['ntp_loss']
     loss_dict['unscaled_step_loss'] = loss_dict['unscaled_rec_loss'] + loss_dict['unscaled_vq_loss'] + loss_dict['unscaled_ntp_loss']
     return loss_dict, x_pred_aligned, x_true_aligned
+
+
+
+
+

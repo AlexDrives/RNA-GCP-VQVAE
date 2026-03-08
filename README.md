@@ -1,461 +1,437 @@
-# GCP-VQVAE: A Geometry-Complete Language for Protein 3D Structure
+﻿# RNA GCP-VQVAE
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![bioRxiv Preprint](https://img.shields.io/badge/bioRxiv-10.1101/2025.10.01.679833v1-brightgreen)](https://www.biorxiv.org/content/10.1101/2025.10.01.679833v1)
+RNA adaptation of GCP-VQVAE for backbone structure tokenization and reconstruction.
 
-<p align="center">
-  <img src="src/logo.png" alt="GCP-VQVAE" width="600" />
-</p>
+This repository is an RNA-focused adaptation of the original GCP-VQVAE project. We explicitly acknowledge and thank the original GCP-VQVAE authors, Mahdi Pourmirzaei, Alex Morehead, Farzaneh Esmaili, Jarett Ren, Mohammadreza Pourmirzaei, and Dong Xu, for releasing the original method and codebase that this work builds upon.
 
+本仓库是在原始 GCP-VQVAE 项目基础上发展出的 RNA 版本。这里首先明确致谢 GCP-VQVAE 原作者 Mahdi Pourmirzaei、Alex Morehead、Farzaneh Esmaili、Jarett Ren、Mohammadreza Pourmirzaei 和 Dong Xu，本项目建立在他们公开的方法与代码基础之上。
 
-## Abstract
+This repository keeps the original GCP-VQVAE architecture skeleton, but the current training path is RNA-specific:
 
-Converting protein tertiary structure into discrete tokens via vector-quantized variational autoencoders (VQ-VAEs) creates a language of 3D geometry and provides a natural interface between sequence and structure models. While pose invariance is commonly enforced, retaining chirality and directional cues without sacrificing reconstruction accuracy remains challenging. In this paper, we introduce GCP-VQVAE, a geometry-complete tokenizer built around a strictly SE(3)-equivariant GCPNet encoder that preserves orientation and chirality of protein backbones. We vector-quantize rotation/translation-invariant readouts that retain chirality into a 4096-token vocabulary, and a transformer decoder maps tokens back to backbone coordinates via a 6D rotation head trained with SE(3)-invariant objectives.
+- raw data are split at the PDB level with homology control
+- split PDBs are converted to RNA HDF5 files
+- training reads RNA HDF5 files and uses RNA-specific graph features, decoder templates, and loss branches
 
-Building on these properties, we train GCP-VQVAE on a corpus of 24 million monomer protein backbone structures gathered from the AlphaFold Protein Structure Database. On the CAMEO2024, CASP15, and CASP16 evaluation datasets, the model achieves backbone RMSDs of 0.4377 Å, 0.5293 Å, and 0.7567 Å, respectively, and achieves 100% codebook utilization on a held-out validation set, substantially outperforming prior VQ-VAE–based tokenizers and achieving state-of-the-art performance. Beyond these benchmarks, on a zero-shot set of 1938 completely new experimental structures, GCP-VQVAE attains a backbone RMSD of 0.8193 Å and a TM-score of 0.9673, demonstrating robust generalization to unseen proteins. Lastly, we elaborate on the various applications of this foundation-like model, such as protein structure compression and the integration of generative protein language models. We make the GCP-VQVAE source code, zero-shot dataset, and its pretrained weights fully open for the research community.
+## Overview
 
-<img src="src/reconstruction.png" alt="Reconstruction Example" width="1000">
+项目概览。
+The active RNA training stack is built around these files:
 
-## News
-- 🗓️ **25 Sept 2025** — 🎉 Our paper was accepted to the NeurIPS 2025 AI4Science workshop!
-- 🗓️ **3 Oct 2025** — Our preprint has been published in [bioRxiv](https://www.biorxiv.org/content/10.1101/2025.10.01.679833v1).
-- 🗓️ **10 Oct 2025** — 🚀 Pretrained checkpoints and evaluation datasets are now available for download!
-- 🗓️ **17 Oct 2025** - Release a lite version of GCP-VQVAE with half the parameters.
-
-
-
-## Requirements
-
-- Python 3.10+
-- PyTorch 2.5+
-- CUDA-compatible GPU
-- 16GB+ GPU memory recommended for training
-
+- data split: [`data/rna_homology_split.py`](data/rna_homology_split.py)
+- PDB to H5 conversion: [`data/rna_pdb_to_h5.py`](data/rna_pdb_to_h5.py)
+- RNA dataset loader: [`data/dataset.py`](data/dataset.py)
+- RNA encoder config: [`configs/config_gcpnet_encoder_rna.yaml`](configs/config_gcpnet_encoder_rna.yaml)
+- RNA training configs:
+  - scratch: [`configs/config_vqvae_dihedral.yaml`](configs/config_vqvae_dihedral.yaml)
+  - continue: [`configs/config_vqvae_dihedral_continue.yaml`](configs/config_vqvae_dihedral_continue.yaml)
+  - continue + validate every epoch: [`configs/config_vqvae_dihedral_continue_val.yaml`](configs/config_vqvae_dihedral_continue_val.yaml)
+- training entry: [`train.py`](train.py)
 
 ## Installation
 
-### Option 1: Using Pre-built Docker Images
+安装说明。
+Core dependencies:
 
-For AMD64 systems:
-```bash
-docker pull mahdip72/vqvae3d:amd_v8
-docker run --gpus all -it mahdip72/vqvae3d:amd_v8
-```
+核心依赖：
+- Python 3.10
+- PyTorch
+- torch-geometric
+- torch-scatter
+- torch-cluster
+- accelerate
+- transformers
+- vector-quantize-pytorch
+- x-transformers
+- graphein
+- h5py
+- biopython
+- tmtools
 
-For ARM64 systems:
-```bash
-docker pull mahdip72/vqvae3d:arm_v3
-docker run --gpus all -it mahdip72/vqvae3d:arm_v3
-```
+Recommended one-line installation:
 
-### Option 2: Building from Dockerfile
-
-```bash
-# Clone the repository
-git clone https://github.com/mahdip72/vq_encoder_decoder.git
-cd vq_encoder_decoder
-
-# Build the Docker image
-docker build -t vqvae3d .
-
-# Run the container
-docker run --gpus all -it vqvae3d
-```
-
-#### (Optional, Hopper only) FlashAttention-3
-If you are on H100, H800, GH200, H200 (SM90) you can enable FlashAttention-3 for faster, lower‑memory attention.
-
-Build with FA3 baked in:
-```bash
-docker build --build-arg FA3=1 -t vqvae3d-fa3 .
-```
-
-## Data
-
-### Evaluation Datasets
-
-| Dataset | Description | Download Link |
-|---------|-------------|---------------|
-| CAMEO2024 | CAMEO 2024 evaluation dataset | [Download](https://mailmissouri-my.sharepoint.com/:f:/g/personal/mpngf_umsystem_edu/ErhhREP9bH5AoBBOe5IshCUBix3KAvYvZpAS7f1FS3pB_g?e=gQPDWl) |
-| CASP14 | CASP 14 evaluation dataset | [Download](https://mailmissouri-my.sharepoint.com/:f:/g/personal/mpngf_umsystem_edu/EgMgJtM0fdNHpU46opUf0OgBZxhlJiV8Xu8N1Ke2lgw0mg?e=0d46eL) |
-| CASP15 | CASP 15 evaluation dataset | [Download](https://mailmissouri-my.sharepoint.com/:f:/g/personal/mpngf_umsystem_edu/EgMgJtM0fdNHpU46opUf0OgBZxhlJiV8Xu8N1Ke2lgw0mg?e=0d46eL) |
-| CASP16 | CASP 16 evaluation dataset | [Download](https://mailmissouri-my.sharepoint.com/:f:/g/personal/mpngf_umsystem_edu/EgMgJtM0fdNHpU46opUf0OgBZxhlJiV8Xu8N1Ke2lgw0mg?e=0d46eL) |
-| Zero-Shot | Zero-shot evaluation dataset | [Download](https://mailmissouri-my.sharepoint.com/:f:/g/personal/mpngf_umsystem_edu/EiPEh9RGgypEi_LRWlNhLi0BSlbFsr9VryhKT1v8MYLj7Q?e=Uhr3bF) |
-
-### Download PDBs with Foldcomp (recommended)
-We provide a helper script to fetch a Foldcomp-formatted database and extract structures to uncompressed `.pdb` files. See the official docs for more details: [Foldcomp README](https://github.com/steineggerlab/foldcomp) and the [Foldcomp download server](https://foldcomp.steineggerlab.workers.dev/).
-
-Quick start (preferred):
-```bash
-# 1) Open the script and set parameters at the top:
-#    - DATABASE_NAME (e.g. afdb_swissprot_v4, afdb_uniprot_v4, afdb_rep_v4, afdb_rep_dark_v4,
-#      esmatlas, esmatlas_v2023_02, highquality_clust30, or organism sets like h_sapiens)
-#    - DOWNLOAD_DIR (where DB files live)
-#    - OUTPUT_DIR (where .pdb files will be written)
-
-nano data/download_foldcomp_db_to_pdb.sh
-
-# 2) Run the script
-bash data/download_foldcomp_db_to_pdb.sh
-
-# The script will (a) fetch the DB via the optional Python helper if available,
-# or instruct you to download DB files from the Foldcomp server, then (b) call
-# `foldcomp decompress` to write uncompressed .pdb files to OUTPUT_DIR.
-```
-
-Notes:
-- You need the `foldcomp` CLI in your PATH. Install guidance is available in the [Foldcomp README](https://github.com/steineggerlab/foldcomp).
-- The script optionally uses the Python package `foldcomp` to auto-download DB files. If not present, it prints the exact files to fetch from the official server.
-- After PDBs are downloaded, continue with the converters below to produce the `.h5` dataset used by this repo.
-
-### HDF5 format used by this repo
-- **seq**: length‑L amino‑acid string. Standard 20‑letter alphabet; **X** marks unknowns and numbering gaps.
-- **N_CA_C_O_coord**: float array of shape (L, 4, 3). Backbone atom coordinates in Å for [N, CA, C, O] per residue. Missing atoms/residues are NaN‑filled.
-- **plddt_scores**: float array of shape (L,). Per‑residue pLDDT pulled from B‑factors when present; NaN if unavailable.
-
-### Convert PDB/CIF → HDF5
-This script scans a directory recursively and writes one `.h5` per processed chain.
-- **Input format**: By default it searches for `.pdb`. Use `--use_cif` to read `.cif` files (no `.cif.gz`).
-- **Chain filtering**: drops chains whose final length (after gap handling) is < `--min_len` or > `--max_len`.
-- **Duplicate sequences**: among highly similar chains (identity > 0.95), keeps the one with the most resolved CA atoms.
-- **Numbering gaps & insertions**: handles insertion codes natively. For numeric residue‑number gaps (both PDB and CIF), inserts `X` residues with NaN coords. If a gap exceeds `--gap_threshold` (default 5), reduces the number of inserted residues using the straight‑line CA–CA distance (assumes ~3.8 Å per residue); if CA coords are missing, caps at the threshold. This prevents runaway padding for CIF files with non‑contiguous author numbering.
-- **Outputs**: by default filenames are `<index>_<basename>.h5` or `<index>_<basename>_chain_id_<ID>.h5` for multi‑chain structures. Add `--no_file_index` to omit the `<index>_` prefix.
-
-Examples:
-```bash
-# Default: PDB input
-python data/pdb_to_h5.py \
-  --data /abs/path/to/pdb_root \
-  --save_path /abs/path/to/output_h5 \
-  --max_len 2048 \
-  --min_len 25 \
-  --max_workers 16
-```
+推荐的一行安装命令：
 
 ```bash
-# CIF input (no .gz)
-python data/pdb_to_h5.py \
-  --use_cif \
-  --data /abs/path/to/cif_root \
-  --save_path /abs/path/to/output_h5
+bash install.sh
 ```
+
+For an exact frozen environment, use:
+
+如果需要严格复现冻结环境，可使用：
 
 ```bash
-# Control large numeric gaps with CA–CA estimate (applies to PDB and CIF)
-python data/pdb_to_h5.py \
-  --data /abs/path/to/structures \
-  --save_path /abs/path/to/output_h5 \
-  --gap_threshold 5
+pip install -r requirements_freeze.txt
 ```
 
+Optional, Hopper only:
+
+可选，Hopper GPU 专用：
 ```bash
-# Omit index from output filenames
-python data/pdb_to_h5.py \
-  --no_file_index \
-  --data /abs/path/to/pdb_or_cif_root \
-  --save_path /abs/path/to/output_h5
+bash install_flash_attention_3_hopper.sh
 ```
 
-### Convert HDF5 → PDB
-Converts `.h5` backbones to PDB, writing only N/CA/C atoms and skipping residues with any NaN coordinates.
+Install scripts:
+
+相关安装文件：
+- base environment: [`install.sh`](install.sh)
+- FlashAttention-3 for Hopper: [`install_flash_attention_3_hopper.sh`](install_flash_attention_3_hopper.sh)
+- frozen package list: [`requirements_freeze.txt`](requirements_freeze.txt)
+
+## Data Pipeline
+
+数据处理流程。
+The intended RNA pipeline is:
+
+推荐的数据流程如下：
+
+1. split raw PDB files by homology
+2. convert split PDBs to RNA HDF5
+3. point the training config to the generated HDF5 split directories
+4. launch training with `accelerate`
+
+This is intentionally decoupled:
+
+这几个步骤是刻意解耦的：
+- homology split outputs PDB files, not H5
+- training consumes H5 files, not raw PDBs
+
+The trainer enforces this at load time in [`data/dataset.py`](data/dataset.py).
+
+训练器会在加载阶段检查这一约束，相关逻辑见 [`data/dataset.py`](data/dataset.py)。
+## Dataset
+
+数据集说明。
+The dataset is built from the RNAsolo database, which collects experimentally determined RNA 3D structures from the Protein Data Bank (PDB), removes non-RNA chains, and organizes structures into equivalence classes to provide non-redundant representatives.
+
+本项目的数据集来自 RNAsolo。RNAsolo 从 PDB 收集实验解析得到的 RNA 三维结构，去除非 RNA 链，并按等价类组织为非冗余代表集。
+Dataset construction workflow:
+
+数据构建流程：
+1. RNA structures are downloaded from RNAsolo.
+2. The following filters are applied: repository `BGSU`, redundancy `representatives`, experimental methods `X-ray crystallography` and `NMR spectroscopy`, X-ray resolution `<= 3.0 A`, and molecule type `all`.
+3. Because RNAsolo files already contain RNA chains only, no additional protein-chain removal is required.
+4. If a PDB file contains multiple RNA chains, each chain is treated as an independent sample during preprocessing.
+5. Only the RNA backbone atoms required by the model are retained when converting structures into training-ready HDF5 files.
+
+## Step 1: Homology Split Raw PDBs
+
+第 1 步：对原始 PDB 做同源划分。
+Use [`data/rna_homology_split.py`](data/rna_homology_split.py).
+
+This script currently:
+
+- parses BGSU-style filenames such as `PDB_00001A9N_1_Q.pdb`
+- queries RCSB for RNA sequences
+- clusters sequences with `cd-hit-est`
+- writes `train/val/test` split directories containing symlinks or copies of the original PDBs
+
+Important:
+
+注意：
+- current `cd-hit-est` usage in this repo requires `--identity >= 0.80`
+- the script supports shared cache reuse through `--rcsb_cache_path`
 
 Example:
+
 ```bash
-python data/h5_to_pdb.py \
-  --h5_dir /abs/path/to/input_h5 \
-  --pdb_dir /abs/path/to/output_pdb
+python -u data/rna_homology_split.py \
+  --input_root /path/to/raw_bgsu_pdb_root \
+  --extensions .pdb \
+  --output_dir /path/to/bgsu_pdb_homology_split_c80 \
+  --identity 0.80 \
+  --train_ratio 0.70 \
+  --val_ratio 0.15 \
+  --test_ratio 0.15 \
+  --threads 16 \
+  --materialize symlink \
+  --api_sleep_s 0.15 \
+  --cache_flush_every 20 \
+  --rcsb_cache_path /path/to/rcsb_cache_bgsu.json \
+  --overwrite
 ```
 
-### Split complexes into monomer PDBs
-Scans a directory recursively and writes one PDB per selected chain, deduplicating highly similar chains.
+Relevant code:
 
-- **Input format**: By default it searches for `.pdb`. Use `--use_cif` to read `.cif` files (no `.cif.gz`).
-- **Chain filtering**: drops chains whose final length (after gap checks) is < `--min_len` or > `--max_len`.
-- **Duplicate sequences**: among highly similar chains (identity > 0.90), keeps the one with the most resolved CA atoms.
-- **Numbering gaps**: for large numeric residue‑numbering gaps, uses the straight‑line CA–CA distance to cap the number of inserted missing residues (quality control; outputs remain original coordinates).
-- **Outputs**: default filenames are `<basename>_chain_id_<ID>.pdb`. Add `--with_file_index` to prefix with `<index>_`. Output chain ID is set to "A".
+对应代码：
+- BGSU filename parsing: [`data/rna_homology_split.py`](data/rna_homology_split.py)
+- chain-group resolution such as `A-B`: [`data/rna_homology_split.py`](data/rna_homology_split.py)
+- `cd-hit-est` identity guard: [`data/rna_homology_split.py`](data/rna_homology_split.py)
 
-Examples:
+## Step 2: Convert Split PDBs to RNA HDF5
+
+第 2 步：将划分后的 PDB 转为 RNA HDF5。
+Use [`data/rna_pdb_to_h5.py`](data/rna_pdb_to_h5.py).
+
+This converter writes RNA-specific datasets:
+
+转换后会写入以下 RNA 专用字段：
+- `seq`
+- `C4p_C1p_N_coord`
+- `plddt_scores`
+- `P_O5p_C5p_C4p_C3p_O3p_coord`
+
+Example:
+
 ```bash
-# Default: PDB input
-python data/break_complex_to_monumers.py \
-  --data /abs/path/to/structures \
-  --save_path /abs/path/to/output_pdb \
-  --max_len 2048 \
-  --min_len 25 \
-  --max_workers 16
+for split in train val test; do
+  python -u data/rna_pdb_to_h5.py \
+    --data /path/to/bgsu_pdb_homology_split_c80/splits/${split} \
+    --save_path /path/to/bgsu_h5_homology_split_c80/splits/${split} \
+    --max_len 511 \
+    --min_len 11 \
+    --max_missing_ratio 0.30 \
+    --gap_threshold 5 \
+    --max_workers 16
+done
 ```
 
+Relevant code:
+
+对应代码：
+- RNA residue and atom mapping: [`data/rna_pdb_to_h5.py`](data/rna_pdb_to_h5.py)
+- RNA H5 keys: [`data/rna_pdb_to_h5.py`](data/rna_pdb_to_h5.py)
+
+## Step 3: Modify Training Paths
+
+第 3 步：修改训练配置中的路径。
+You only need to edit a few keys in the config files.
+
+通常只需要修改少数几个配置项。
+### Scratch Training
+
+Edit [`configs/config_vqvae_dihedral.yaml`](configs/config_vqvae_dihedral.yaml):
+
+- `train_settings.data_path`
+- `valid_settings.data_path`
+- optionally `result_path`
+
+### Continue Training
+
+Edit [`configs/config_vqvae_dihedral_continue.yaml`](configs/config_vqvae_dihedral_continue.yaml):
+
+- `train_settings.data_path`
+- `valid_settings.data_path`
+- `resume.resume_path`
+- optionally `result_path`
+
+### Continue Training With Validation Every Epoch
+
+Edit [`configs/config_vqvae_dihedral_continue_val.yaml`](configs/config_vqvae_dihedral_continue_val.yaml):
+
+- `train_settings.data_path`
+- `valid_settings.data_path`
+- `resume.resume_path`
+- optionally `result_path`
+
+This file already sets:
+
+这个配置已经默认设置：
+- `valid_settings.do_every: 1`
+
+So it is the config to use when you want to continue training and run validation every epoch.
+
+因此，如果你希望继续训练并且每个 epoch 都做验证，直接使用这个配置文件。
+## Which Config To Use
+
+不同场景下推荐使用的配置文件。
+Recommended mapping:
+
+| Scenario | Config |
+| --- | --- |
+| Train from scratch on RNA | [`configs/config_vqvae_dihedral.yaml`](configs/config_vqvae_dihedral.yaml) |
+| Continue training from an existing checkpoint | [`configs/config_vqvae_dihedral_continue.yaml`](configs/config_vqvae_dihedral_continue.yaml) |
+| Continue training and validate every epoch | [`configs/config_vqvae_dihedral_continue_val.yaml`](configs/config_vqvae_dihedral_continue_val.yaml) |
+
+## Training Commands
+
+训练命令。
+First configure Accelerate once:
+
+首先执行一次 Accelerate 初始化配置：
+
 ```bash
-# CIF input (no .gz)
-python data/break_complex_to_monumers.py \
-  --use_cif \
-  --data /abs/path/to/cif_root \
-  --save_path /abs/path/to/output_pdb
-```
-
-### How inference/evaluation use `.h5`
-- **Inference**: `inference_encode.py` and `inference_embed.py` read datasets from `.h5` in the format above. `inference_decode.py` decodes VQ indices (from CSV) to backbone coordinates; you can convert decoded `.h5`/coords to PDB with `data/h5_to_pdb.py`.
-- **Evaluation**: `evaluation.py` consumes an `.h5` file via `data_path` in `configs/evaluation_config.yaml` and reports TM‑score/RMSD; it can also write aligned PDBs.
-
-## Usage
-
-Before you begin:
-- Prepare your dataset in `.h5` format as described in [Data](#data). Use the PDB → HDF5 converter in `data/pdb_to_h5.py`.
-
-### Training
-
-Configure your training parameters in `configs/config_vqvae.yaml` and run:
-
-Note:
-- Training expects datasets in the HDF5 layout defined in [HDF5 format used by this repo](#hdf5-format-used-by-this-repo).
-
-```bash
-# Set up accelerator configuration for multi-GPU training
 accelerate config
-
-# Start training with accelerate for multi-GPU support
-accelerate launch train.py --config_path configs/config_vqvae.yaml
 ```
 
-See the [Accelerate documentation](https://huggingface.co/docs/accelerate/index) for more options and configurations.
+### Train From Scratch
 
-### Inference
-
-### Pretrained Models
-
-| Model | Description | Download Link                                                                                                                                |
-|-------|-------------|----------------------------------------------------------------------------------------------------------------------------------------------|
-| Large | Full GCP-VQVAE model with best performance | [Download](https://mailmissouri-my.sharepoint.com/:u:/g/personal/mpngf_umsystem_edu/EaxLj74pK5BArOpPkF9MkDgBHxlfaDpAElPRiwH9BsIedA?e=34ida8) |
-| Lite | Lightweight version for faster inference | [Download](https://mailmissouri-my.sharepoint.com/:u:/g/personal/mpngf_umsystem_edu/EUXZF_Is2X9IrjLeIWk7T5gBNb3yliRwVOAWi2rHyyympg?e=VAveKw) |                                                                                                                                |
-
-**Setup Instructions:**
-1. Download the zip file of the checkpoint
-2. Extract the checkpoint folder
-3. Set the `trained_model_dir` path in your config file (following ones) to point to the right checkpoint.
-
-
-Multi‑GPU with Hugging Face Accelerate:
-- The following scripts support multi‑GPU via Accelerate: `inference_encode.py`, `inference_embed.py`, `inference_decode.py`, and `evaluation.py`.
-
-Example (2 GPUs, bfloat16):
 ```bash
-accelerate launch --multi_gpu --mixed_precision=bf16 --num_processes=2 evaluation.py
+accelerate launch --mixed_precision=bf16 train.py \
+  --config_path configs/config_vqvae_dihedral.yaml
 ```
-Or like in Training, configure Accelerate first:
+
+### Continue Training
+
 ```bash
-accelerate config
-accelerate launch evaluation.py
+accelerate launch --mixed_precision=bf16 train.py \
+  --config_path configs/config_vqvae_dihedral_continue.yaml
 ```
 
+### Continue Training and Validate Every Epoch
 
-See the [Accelerate documentation](https://huggingface.co/docs/accelerate/index) for more options and configurations.
-
-All inference scripts consume `.h5` inputs in the format defined in [Data](#data).
-
-To extract the VQ codebook embeddings:
 ```bash
-python codebook_extraction.py
+accelerate launch --mixed_precision=bf16 train.py \
+  --config_path configs/config_vqvae_dihedral_continue_val.yaml
 ```
-Edit `configs/inference_codebook_extraction_config.yaml` to change paths and output filename.
 
-To encode proteins into discrete VQ indices:
+Example single-GPU command:
+
+单卡示例命令：
 ```bash
-python inference_encode.py
+CUDA_VISIBLE_DEVICES=0 accelerate launch \
+  --num_processes 1 \
+  --num_machines 1 \
+  --mixed_precision bf16 \
+  --dynamo_backend no \
+  train.py --config_path configs/config_vqvae_dihedral_continue_val.yaml
 ```
-Edit `configs/inference_encode_config.yaml` to change dataset paths, model, and output. Input datasets should be `.h5` as in [HDF5 format used by this repo](#hdf5-format-used-by-this-repo).
 
-To extract per‑residue embeddings from the VQ layer:
+## What Changed For RNA
+
+相对蛋白版本，RNA 版本的主要改动如下。
+Compared with the original protein-oriented code path, the RNA version changes the following parts.
+
+### 1. RNA modality switch in the trainer
+
+1. 在训练入口中增加 RNA 模态分支。
+Training now dispatches by `data_modality: rna` and can optionally estimate an RNA rigid template from training H5 files.
+
+Relevant code:
+
+- modality resolution and RNA template injection: [`train.py`](train.py)
+- training/validation entry loops: [`train.py`](train.py)
+
+### 2. RNA-specific dataset and H5 format
+
+2. 新增 RNA 专用数据集与 HDF5 格式。
+The RNA loader reads:
+
+- `C4p_C1p_N_coord` as the 3-atom rigid-body representation
+- `P_O5p_C5p_C4p_C3p_O3p_coord` as auxiliary backbone coordinates for dihedral features
+
+Relevant code:
+
+- RNA H5 loading: [`data/dataset.py`](data/dataset.py)
+- RNA dataset class: [`data/dataset.py`](data/dataset.py)
+- trainer-side H5 requirement for train/val splits: [`data/dataset.py`](data/dataset.py)
+
+### 3. RNA encoder feature set
+
+3. 使用 RNA 专用编码器特征。
+The protein encoder config is replaced by [`configs/config_gcpnet_encoder_rna.yaml`](configs/config_gcpnet_encoder_rna.yaml), which uses:
+
+- `representation: C1P`
+- `rna_base_one_hot`
+- `sequence_positional_encoding`
+- `rna_purine_pyrimidine`
+- `rna_backbone_dihedrals_sincos`
+- `rna_orientation`
+
+Relevant code:
+
+- RNA encoder config: [`configs/config_gcpnet_encoder_rna.yaml`](configs/config_gcpnet_encoder_rna.yaml)
+- RNA feature dispatch in model preparation: [`models/super_model.py`](models/super_model.py)
+- RNA scalar/vector node feature implementation: [`models/gcpnet/features/node_features.py`](models/gcpnet/features/node_features.py)
+
+### 4. RNA backbone dihedral features
+
+4. 新增 RNA backbone 二面角特征。
+RNA dihedrals are computed from `x.rna_backbone_coords` with atom order:
+
+- `[P, O5', C5', C4', C3', O3']`
+
+Per residue, the encoder receives sin/cos features for:
+
+- `alpha`
+- `beta`
+- `gamma`
+- `delta`
+- `epsilon`
+- `zeta`
+
+Relevant code:
+
+- dihedral implementation: [`models/gcpnet/features/node_features.py`](models/gcpnet/features/node_features.py)
+
+### 5. RNA decoder template
+
+5. 解码器使用 RNA 局部模板坐标。
+The decoder uses RNA local template coordinates instead of the protein `[N, CA, C]` template.
+
+Relevant code:
+
+- RNA template constants: [`models/gcpnet/layers/structure_proj.py`](models/gcpnet/layers/structure_proj.py)
+- decoder-side RNA template selection: [`models/decoders.py`](models/decoders.py)
+- runtime replacement with estimated template: [`train.py`](train.py)
+
+### 6. RNA-aware loss branch
+
+6. 损失函数按 RNA 模态分支。
+The reconstruction loss stays structurally the same, but direction and pairwise terms branch on `data_modality`.
+
+Current reconstruction loss includes:
+
+- MSE
+- backbone distance loss
+- backbone direction loss
+- optional binned direction classification loss
+- optional binned distance classification loss
+- optional TikTok padding loss
+
+Relevant code:
+
+- reconstruction loss assembly: [`utils/custom_losses.py`](utils/custom_losses.py)
+
+## Minimal End-to-End Workflow
+
+最小可运行全流程示例。
 ```bash
-python inference_embed.py
-```
-Edit `configs/inference_embed_config.yaml` to change dataset paths, model, and output HDF5. Input `.h5` files must follow [HDF5 format used by this repo](#hdf5-format-used-by-this-repo).
+# 1) split raw RNA PDBs
+python -u data/rna_homology_split.py \
+  --input_root /path/to/raw_bgsu_pdb_root \
+  --extensions .pdb \
+  --output_dir /path/to/bgsu_pdb_homology_split_c80 \
+  --identity 0.80 \
+  --train_ratio 0.70 \
+  --val_ratio 0.15 \
+  --test_ratio 0.15 \
+  --threads 16 \
+  --materialize symlink \
+  --api_sleep_s 0.15 \
+  --cache_flush_every 20 \
+  --rcsb_cache_path /path/to/rcsb_cache_bgsu.json \
+  --overwrite
 
-To decode VQ indices back to 3D backbone structures:
+# 2) convert split PDBs to H5
+for split in train val test; do
+  python -u data/rna_pdb_to_h5.py \
+    --data /path/to/bgsu_pdb_homology_split_c80/splits/${split} \
+    --save_path /path/to/bgsu_h5_homology_split_c80/splits/${split} \
+    --max_len 511 \
+    --min_len 11 \
+    --max_missing_ratio 0.30 \
+    --gap_threshold 5 \
+    --max_workers 16
+done
+
+# 3) train from scratch
+accelerate launch --mixed_precision=bf16 train.py \
+  --config_path configs/config_vqvae_dihedral.yaml
+```
+
+Or, if you are continuing and want validation every epoch:
+
+如果你是继续训练，并希望每个 epoch 都进行验证：
+
 ```bash
-python inference_decode.py
-```
-Edit `configs/inference_decode_config.yaml` to point to the indices CSV and adjust runtime. To write PDBs from decoded outputs, see [Convert HDF5 → PDB](#convert-hdf5--pdb-datah5_to_pdbpy).
-
-### Evaluation
-
-To evaluate predictions and write TM‑score/RMSD along with aligned PDBs:
-```bash
-python evaluation.py
+accelerate launch --mixed_precision=bf16 train.py \
+  --config_path configs/config_vqvae_dihedral_continue_val.yaml
 ```
 
-Notes:
-- Set `data_path` to an `.h5` dataset that follows [HDF5 format used by this repo](#hdf5-format-used-by-this-repo).
-- To visualize results as PDB, convert `.h5` outputs with [`data/h5_to_pdb.py`](#convert-hdf5--pdb-datah5_to_pdbpy).
+## Citation
 
-Example config template (`configs/evaluation_config.yaml`):
-```yaml
-trained_model_dir: "/abs/path/to/trained_model"   # Folder containing checkpoint and saved YAMLs
-checkpoint_path: "checkpoints/best_valid.pth"     # Relative to trained_model_dir
-config_vqvae: "config_vqvae.yaml"                 # Names of saved training YAMLs
-config_encoder: "config_gcpnet_encoder.yaml"
-config_decoder: "config_geometric_decoder.yaml"
-
-data_path: "/abs/path/to/evaluation/data.h5"      # HDF5 used for evaluation
-output_base_dir: "evaluation_results"              # A timestamped subdir is created inside
-
-batch_size: 8
-shuffle: true
-num_workers: 0
-max_task_samples: 5000000                           # Optional cap
-vq_indices_csv_filename: "vq_indices.csv"          # Also writes observed VQ indices
-alignment_strategy: "kabsch"                       # "kabsch" or "no"
-mixed_precision: "bf16"                            # "no", "fp16", "bf16", "fp8"
-
-tqdm_progress_bar: true
-```
-
-## External Tokenizer Evaluations
-
-We evaluated additional VQ-VAE backbones alongside GCP-VQVAE:
-
-- ESM3 VQVAE (forked repo: [mahdip72/esm](https://github.com/mahdip72/esm)) – community can reuse `pdb_to_tokens.py` and `tokens_to_pdb.py` that we authored because the upstream project lacks ready-to-use scripts.
-- FoldToken-4 (forked repo: [mahdip72/FoldToken_open](https://github.com/mahdip72/FoldToken_open)) – we rewrote `foldtoken/pdb_to_token.py` and `foldtoken/token_to_pdb.py` for better performance and efficiency with negligible increase in error.
-- Structure Tokenizer ([instadeepai/protein-structure-tokenizer](https://github.com/instadeepai/protein-structure-tokenizer)) – results reproduced with the official implementation.
-
-We welcome independent validation of our ESM3 and FoldToken-4 conversion scripts to further confirm their correctness.
-
-## Results
-
-The table below reproduces Table 2 from the manuscript: reconstruction accuracy on community benchmarks and a zero-shot setting. Metrics are backbone TM-score (↑) and RMSD in Å (↓).
-
-<table style="font-size:70%; line-height:1.05;">
-  <thead>
-    <tr>
-      <th style="text-align:right;">Dataset</th>
-      <th style="text-align:left;">Metric</th>
-      <th><strong>GCP-VQVAE (Ours)</strong></th>
-      <th>GCP-VQVAE Lite (Ours)</th>
-      <th>FoldToken 4 (Gao et al., 2024c)</th>
-      <th>ESM-3 VQVAE (Hayes et al., 2025)</th>
-      <th>(Gaujac et al., 2024)</th>
-    </tr>
-  </thead>
-  <tbody>
-    <tr>
-      <td style="text-align:right;" rowspan="2">CASP14</td>
-      <td>TM-score</td>
-      <td><strong>0.9890</strong></td>
-      <td>0.9751</td>
-      <td>0.5410</td>
-      <td>0.5042</td>
-      <td>0.3624</td>
-    </tr>
-    <tr>
-      <td>RMSD</td>
-      <td><strong>0.5431</strong></td>
-      <td>0.8435</td>
-      <td>8.9838</td>
-      <td>10.4611</td>
-      <td>10.5344</td>
-    </tr>
-    <tr>
-      <td style="text-align:right;" rowspan="2">CASP15</td>
-      <td>TM-score</td>
-      <td><strong>0.9884</strong></td>
-      <td>0.9665</td>
-      <td>0.3289</td>
-      <td>0.3206</td>
-      <td>0.2329</td>
-    </tr>
-    <tr>
-      <td>RMSD</td>
-      <td><strong>0.5293</strong></td>
-      <td>0.9219</td>
-      <td>14.6702</td>
-      <td>13.1877</td>
-      <td>14.8956</td>
-    </tr>
-    <tr>
-      <td style="text-align:right;" rowspan="2">CASP16</td>
-      <td>TM-score</td>
-      <td><strong>0.9857</strong></td>
-      <td>0.9757</td>
-      <td>0.8055</td>
-      <td>0.7685</td>
-      <td>0.6058</td>
-    </tr>
-    <tr>
-      <td>RMSD</td>
-      <td><strong>0.7567</strong></td>
-      <td>1.0614</td>
-      <td>5.5094</td>
-      <td>8.2640</td>
-      <td>8.7106</td>
-    </tr>
-    <tr>
-      <td style="text-align:right;" rowspan="2">CAMEO2024</td>
-      <td>TM-score</td>
-      <td><strong>0.9918</strong></td>
-      <td>0.9794</td>
-      <td>0.4784</td>
-      <td>0.4633</td>
-      <td>0.3575</td>
-    </tr>
-    <tr>
-      <td>RMSD</td>
-      <td><strong>0.4377</strong></td>
-      <td>0.7401</td>
-      <td>12.1089</td>
-      <td>12.1138</td>
-      <td>13.5360</td>
-    </tr>
-    <tr>
-      <td style="text-align:right;" rowspan="2">Zero-Shot</td>
-      <td>TM-score</td>
-      <td><strong>0.9673</strong></td>
-      <td>0.9466</td>
-      <td>0.3324</td>
-      <td>0.3131</td>
-      <td>-</td>
-    </tr>
-    <tr>
-      <td>RMSD</td>
-      <td><strong>0.8193</strong></td>
-      <td>1.1152</td>
-      <td>17.4449</td>
-      <td>18.9335</td>
-      <td>-</td>
-    </tr>
-  </tbody>
-</table>
-
-Notes:
-- FoldToken 4 uses a 256-size vocabulary; others use 4096.
-- The Structure Tokenizer of Gaujac et al. (2024) only supports sequences of length 50–512; out-of-range samples are excluded for that column only.
-- Zero-shot results for Gaujac et al. (2024) are omitted due to limited coverage.
-- Evaluation scripts for baselines were reproduced where public tooling was incomplete; see repository docs for details.
-
-## Experimental Features
-
-- Added an experimental option to compress token sequences using latent codebooks inspired by [ByteDance’s 1D tokenizer](https://github.com/bytedance/1d-tokenizer); this enables configurable compression factors within our VQ pipeline.
-- Introduced TikTok residual quantization (multi-depth VQ) using a shared codebook when `tik_tok.residual_depth > 1`. Residual latents are packed depth-by-depth, flattened into a single stream for NTP and decoding, and their masks/embeddings remain aligned with the flattened indices. This improves reconstruction capacity without expanding the base codebook.
-- Included an optional next-token prediction head, drawing on the autoregressive regularization ideas from *“When Worse is Better: Navigating the Compression-Generation Tradeoff in Visual Tokenization”*, to encourage codebooks that are friendlier to autoregressive modeling.
-- Enabled adaptive loss coefficients driven by gradient norms: each active loss (MSE, distance/direction, VQ, NTP) tracks its synchronized gradient magnitude and scales its weight toward the 0.2–5.0 norm “comfort zone.” Coefficients shrink when a loss overpowers the rest and grow when its gradients fade, keeping the multi-objective training balanced without constant manual re-tuning.
-
-## Acknowledgments
-
-This repository builds upon several excellent open-source projects:
-
-- [**vector-quantize-pytorch**](https://github.com/lucidrains/vector-quantize-pytorch) – Vector quantization implementations used in our VQ-VAE architecture.
-- [**x-transformers**](https://github.com/lucidrains/x-transformers) – Transformer components integrated into our encoder and decoder modules of VQ-VAE.
-- [**ProteinWorkshop**](https://github.com/a-r-j/ProteinWorkshop) – We slimmed the original workshop down to the GCPNet core and extended it with:
-  - opt-in `torch.compile` support that now powers our training, inference, and evaluation paths (configurable in every config file).
-  - faster aggregation backends: a CSR/`torch.segment_reduce` implementation for PyTorch-only setups and an automatic switch to cuGraph-ops fused aggregators when `pylibcugraphops` is installed.
-  - multi-GPU friendly evaluation utilities that reuse the same compilation flags as training, keeping the code path consistent across scripts.
-
-We gratefully acknowledge **NVIDIA** for providing computational resources via their dedicated server that made 
-this project feasible, enabling us to train and evaluate our models at scale.
-
-
-## 📜 Citation
-
-If you use this code or the pretrained models, please cite the following paper:
+引用信息。
+If you use this repository, please cite the original GCP-VQVAE paper:
 
 ```bibtex
 @article{Pourmirzaei2025gcpvqvae,
@@ -467,3 +443,12 @@ If you use this code or the pretrained models, please cite the following paper:
   url     = {https://www.biorxiv.org/content/10.1101/2025.10.01.679833v1}
 }
 ```
+
+## Acknowledgments
+
+致谢。
+This codebase builds on the original GCP-VQVAE project and its supporting libraries, especially:
+
+- `vector-quantize-pytorch`
+- `x-transformers`
+- `ProteinWorkshop` and GCPNet-related components

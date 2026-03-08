@@ -23,7 +23,7 @@ from ..types import (
     VectorNodeFeature,
 )
 
-StructureRepresentation = Literal["ca", "ca_bb", "full_atom"]
+StructureRepresentation = Literal["CA", "C1P"]
 
 
 class ProteinFeaturiser(nn.Module):
@@ -31,7 +31,7 @@ class ProteinFeaturiser(nn.Module):
     Initialise a protein featuriser.
 
     :param representation: Representation to use for the protein.
-        One of ``"ca", "ca_bb", "full_atom"``.
+        One of ``"CA"`` or ``"C1P"``.
     :type representation: StructureRepresentation
     :param scalar_node_features: List of scalar-values node features to
         compute. Options: ``"amino_acid_one_hot",
@@ -135,7 +135,7 @@ class ProteinFeaturiser(nn.Module):
 def _compute_edges(
     batch: Batch, edge_types: List[str]
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Minimal edge constructor supporting knn graphs for CA backbones."""
+    """Minimal edge constructor supporting kNN graphs with precomputed edges."""
 
     if len(edge_types) != 1 or not edge_types[0].startswith("knn_"):
         raise ValueError(

@@ -65,11 +65,32 @@ def load_saved_decoder_config(decoder_cfg_path):
     return decoder_configs
 
 
-def save_predictions_to_pdb(pids, preds, masks, pdb_dir):
+def _resolve_modality(configs) -> str:
+    modality = (
+        getattr(configs.train_settings, "data_modality", None)
+        or getattr(configs.train_settings, "modality", None)
+        or getattr(configs, "data_modality", None)
+        or "protein"
+    )
+    return str(modality).lower()
+
+
+def _backbone_atom_names(modality: str):
+    if modality == "rna":
+        return ("C4'", "C1'", "N1/N9")
+    return ("N", "CA", "C")
+
+
+def save_predictions_to_pdb(
+    pids, preds, masks, pdb_dir, atom_names=("N", "CA", "C"), sequences=None
+):
     """Save backbone PDB files for each sample in the batch."""
-    for pid, coord, mask in zip(pids, preds, masks):
+    for idx, (pid, coord, mask) in enumerate(zip(pids, preds, masks)):
         prefix = os.path.join(pdb_dir, pid)
-        save_backbone_pdb_inference(coord, mask, prefix)
+        seq = sequences[idx] if sequences is not None and idx < len(sequences) else None
+        save_backbone_pdb_inference(
+            coord, mask, prefix, atom_names=atom_names, residue_sequence=seq
+        )
 
 
 def main():
@@ -122,6 +143,8 @@ def main():
 
     # Override task-specific settings
     configs.model.max_length = infer_cfg.get('max_length', configs.model.max_length)
+    modality = _resolve_modality(configs)
+    atom_names = _backbone_atom_names(modality)
 
     # Load decoder config from saved results
     decoder_configs = load_saved_decoder_config(decoder_cfg_path)
@@ -192,8 +215,11 @@ def main():
             preds = bb_pred.view(bb_pred.shape[0], bb_pred.shape[1], 3, 3)
 
             pids = batch['pid']
+            sequences = batch['seq']
 
-            save_predictions_to_pdb(pids, preds.detach().cpu(), masks.cpu(), pdb_dir)
+            save_predictions_to_pdb(
+                pids, preds.detach().cpu(), masks.cpu(), pdb_dir, atom_names=atom_names, sequences=sequences
+            )
 
             # Update progress bar manually
             progress_bar.update(1)

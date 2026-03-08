@@ -34,14 +34,17 @@ def compute_scalar_edge_features(
 def compute_vector_edge_features(
     x: Union[Data, Batch], features: Union[List[str], ListConfig]
 ) -> Union[Data, Batch]:
-    """Return vector edge features; only ``edge_vectors`` is supported."""
+    """Return vector edge features for configured edge vector types."""
 
     vectors = []
     for feature in features:
-        if feature != "edge_vectors":  # pragma: no cover - defensive branch
-            raise ValueError(f"Unsupported vector edge feature: {feature}")
         diff = x.pos[x.edge_index[0]] - x.pos[x.edge_index[1]]
-        vectors.append(_normalize(diff).unsqueeze(-2))
+        if feature == "edge_vectors":
+            vectors.append(_normalize(diff).unsqueeze(-2))
+        elif feature == "edge_displacement_vectors":
+            vectors.append(diff.unsqueeze(-2))
+        else:  # pragma: no cover - defensive branch
+            raise ValueError(f"Unsupported vector edge feature: {feature}")
 
     x.edge_vector_attr = torch.cat(vectors, dim=0)
     return x

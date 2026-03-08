@@ -1,10 +1,11 @@
-trained_model_dir: "path/to/trained_model"  # Directory where the trained model is saved
+trained_model_dir: "/data/ymxue/p2_rnavqvae/alex/gcpvqvae/pretrained_model_best"  # Directory where the trained model is saved
 checkpoint_path: "checkpoints/best_valid.pth"
 config_vqvae: "config_vqvae.yaml"
 config_encoder: "config_gcpnet_encoder.yaml"
 config_decoder: "config_geometric_decoder.yaml"
 
-data_path: "path/to/evaluation/h5/data"
+#data_path: "path/to/evaluation/h5/data"
+data_path: "/data/ymxue/p2_rnavqvae/alex/gcpvqvae/data/evaluation_set/cameo_2048_h5"
 output_base_dir: "evaluation_results"
 
 batch_size: 8

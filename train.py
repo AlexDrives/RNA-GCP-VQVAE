@@ -3,6 +3,7 @@ import numpy as np
 import yaml
 import os
 import torch
+import math
 from utils.custom_losses import calculate_decoder_loss, log_per_loss_grad_norms
 from utils.utils import (
     save_backbone_pdb,
@@ -19,7 +20,7 @@ from accelerate.utils import InitProcessGroupKwargs, DistributedDataParallelKwar
 from datetime import timedelta
 from tqdm import tqdm
 import time
-from data.dataset import prepare_gcpnet_vqvae_dataloaders
+from data.dataset import prepare_gcpnet_vqvae_dataloaders, load_rna_h5_file
 from models.super_model import (
     prepare_model,
     compile_non_gcp_and_exclude_vq,
@@ -41,6 +42,130 @@ from utils.training_helpers import (
 )
 
 
+def _resolve_data_modality(configs) -> str:
+    modality = (
+        getattr(configs.train_settings, "data_modality", None)
+        or getattr(configs.train_settings, "modality", None)
+        or getattr(configs, "data_modality", None)
+        or "protein"
+    )
+    return str(modality).lower()
+
+
+def _backbone_atom_names(configs):
+    if _resolve_data_modality(configs) == "rna":
+        return ("C4'", "C1'", "N1/N9")
+    return ("N", "CA", "C")
+
+
+def _new_rigid_enabled(configs) -> bool:
+    nested = getattr(configs.train_settings, "rna_rigid_template", None)
+    if nested is not None and hasattr(nested, "get"):
+        return bool(nested.get("new_rigid", getattr(configs.train_settings, "new_rigid", False)))
+    return bool(getattr(configs.train_settings, "new_rigid", False))
+
+
+def _new_rigid_max_samples(configs) -> int:
+    nested = getattr(configs.train_settings, "rna_rigid_template", None)
+    if nested is not None and hasattr(nested, "get"):
+        value = nested.get("max_samples", getattr(configs.train_settings, "new_rigid_max_samples", 100))
+    else:
+        value = getattr(configs.train_settings, "new_rigid_max_samples", 100)
+    return max(int(value), 1)
+
+
+def _inject_rna_template_into_decoder_configs(decoder_configs, template_coords, stats):
+    decoder_configs.rna_rigid_template_coords = [[float(v) for v in row] for row in template_coords.tolist()]
+    decoder_configs.rna_rigid_template_stats = {
+        "c4_c1_mean": float(stats["c4_c1_mean"]),
+        "c1_n_mean": float(stats["c1_n_mean"]),
+        "c4_n_mean": float(stats["c4_n_mean"]),
+        "used_files": int(stats["used_files"]),
+        "used_residues": int(stats["used_residues"]),
+    }
+    decoder_configs.rna_rigid_template_source = "estimated_from_training_data"
+
+
+def _save_decoder_config(decoder_configs, result_path):
+    decoder_cfg_path = os.path.join(result_path, "config_geometric_decoder.yaml")
+    with open(decoder_cfg_path, "w") as f:
+        yaml.safe_dump(decoder_configs.to_dict(), f, sort_keys=False)
+
+
+def _estimate_rna_template_from_paths(sample_paths):
+    c4_c1_list = []
+    c1_n_list = []
+    c4_n_list = []
+    used_files = 0
+    used_residues = 0
+
+    for sample_path in sample_paths:
+        try:
+            _, coords, _ = load_rna_h5_file(sample_path)
+        except Exception:
+            continue
+
+        coords_t = torch.as_tensor(coords, dtype=torch.float32)
+        if coords_t.ndim != 3 or coords_t.shape[1:] != (3, 3):
+            continue
+
+        valid = torch.isfinite(coords_t).all(dim=-1).all(dim=-1)
+        if not valid.any():
+            continue
+
+        residue_coords = coords_t[valid]
+        c4 = residue_coords[:, 0]
+        c1 = residue_coords[:, 1]
+        n_atom = residue_coords[:, 2]
+
+        c4_c1_list.append(torch.linalg.norm(c4 - c1, dim=-1))
+        c1_n_list.append(torch.linalg.norm(c1 - n_atom, dim=-1))
+        c4_n_list.append(torch.linalg.norm(c4 - n_atom, dim=-1))
+
+        used_files += 1
+        used_residues += int(valid.sum().item())
+
+    if not c4_c1_list:
+        raise RuntimeError("No valid RNA residues found to estimate rigid template.")
+
+    c4_c1_mean = torch.cat(c4_c1_list).mean().item()
+    c1_n_mean = torch.cat(c1_n_list).mean().item()
+    c4_n_mean = torch.cat(c4_n_list).mean().item()
+
+    if c1_n_mean <= 1e-8:
+        raise RuntimeError("Estimated C1'-N mean is too small to construct a template.")
+
+    x_coord = (c4_c1_mean ** 2 + c1_n_mean ** 2 - c4_n_mean ** 2) / (2.0 * c1_n_mean)
+    y_sq = max(c4_c1_mean ** 2 - x_coord ** 2, 0.0)
+    y_coord = math.sqrt(y_sq)
+
+    template = torch.tensor(
+        [
+            [x_coord, y_coord, 0.0],
+            [0.0, 0.0, 0.0],
+            [c1_n_mean, 0.0, 0.0],
+        ],
+        dtype=torch.float32,
+    )
+    stats = {
+        "c4_c1_mean": c4_c1_mean,
+        "c1_n_mean": c1_n_mean,
+        "c4_n_mean": c4_n_mean,
+        "used_files": used_files,
+        "used_residues": used_residues,
+    }
+    return template, stats
+
+
+def _set_runtime_rna_template(net, template_coords):
+    decoder = getattr(getattr(net, "vqvae", None), "decoder", None)
+    if decoder is None or not hasattr(decoder, "affine_output_projection"):
+        return False
+    buffer = decoder.affine_output_projection.template_coords
+    buffer.copy_(template_coords.to(device=buffer.device, dtype=buffer.dtype))
+    return True
+
+
 def train_loop(net, train_loader, epoch, adaptive_loss_coeffs, **kwargs):
     accelerator = kwargs.pop('accelerator')
     optimizer = kwargs.pop('optimizer')
@@ -50,6 +175,7 @@ def train_loop(net, train_loader, epoch, adaptive_loss_coeffs, **kwargs):
     logging = kwargs.pop('logging')
     profiler = kwargs.pop('profiler')
     profile_train_loop = kwargs.pop('profile_train_loop')
+    atom_names = _backbone_atom_names(configs)
     codebook_size = configs.model.vqvae.vector_quantization.codebook_size
     accum_iter = configs.train_settings.grad_accumulation
     alignment_strategy = configs.train_settings.losses.alignment_strategy
@@ -108,9 +234,13 @@ def train_loop(net, train_loader, epoch, adaptive_loss_coeffs, **kwargs):
                 logging.info(f"Building PDB files for training data in epoch {epoch}")
                 save_backbone_pdb(trans_pred_coords.detach(), masks, data['pid'],
                                   os.path.join(kwargs['result_path'], 'pdb_files',
-                                               f'train_outputs_epoch_{epoch}_step_{i + 1}'))
+                                               f'train_outputs_epoch_{epoch}_step_{i + 1}'),
+                                  atom_names=atom_names,
+                                  residue_sequences=data['seq'])
                 save_backbone_pdb(trans_true_coords.detach().squeeze(), masks, data['pid'],
-                                  os.path.join(kwargs['result_path'], 'pdb_files', f'train_labels_step_{i + 1}'))
+                                  os.path.join(kwargs['result_path'], 'pdb_files', f'train_labels_step_{i + 1}'),
+                                  atom_names=atom_names,
+                                  residue_sequences=data['seq'])
                 logging.info("PDB files are built")
 
             # Update metrics and accumulators
@@ -200,6 +330,7 @@ def valid_loop(net, valid_loader, epoch, **kwargs):
     logging = kwargs.pop('logging')
     codebook_size = configs.model.vqvae.vector_quantization.codebook_size
     alignment_strategy = configs.train_settings.losses.alignment_strategy
+    atom_names = _backbone_atom_names(configs)
 
     # Initialize metrics and accumulators for validation
     metrics = init_metrics(configs, accelerator)
@@ -234,9 +365,13 @@ def valid_loop(net, valid_loader, epoch, **kwargs):
                 logging.info(f"Building PDB files for validation data in epoch {epoch}")
                 save_backbone_pdb(trans_pred_coords.detach(), masks, data['pid'],
                                   os.path.join(kwargs['result_path'], 'pdb_files',
-                                               f'valid_outputs_epoch_{epoch}_step_{i + 1}'))
+                                               f'valid_outputs_epoch_{epoch}_step_{i + 1}'),
+                                  atom_names=atom_names,
+                                  residue_sequences=data['seq'])
                 save_backbone_pdb(trans_true_coords.detach(), masks, data['pid'],
-                                  os.path.join(kwargs['result_path'], 'pdb_files', f'valid_labels_step_{i + 1}'))
+                                  os.path.join(kwargs['result_path'], 'pdb_files', f'valid_labels_step_{i + 1}'),
+                                  atom_names=atom_names,
+                                  residue_sequences=data['seq'])
                 logging.info("PDB files are built")
 
             # Update metrics and losses
@@ -341,6 +476,55 @@ def main(dict_config, config_file_path):
     )
     logging.info('preparing dataloaders are done')
 
+    modality = _resolve_data_modality(configs)
+    runtime_rna_template = None
+    if modality == "rna" and _new_rigid_enabled(configs):
+        template_payload = [None]
+        if accelerator.is_main_process:
+            try:
+                train_dataset = train_dataloader.dataset
+                sample_paths = list(getattr(train_dataset, "h5_samples", []))
+                max_samples = _new_rigid_max_samples(configs)
+                sample_count = min(max_samples, len(sample_paths))
+                if sample_count == 0:
+                    raise RuntimeError("RNA training dataset is empty.")
+
+                template_coords, template_stats = _estimate_rna_template_from_paths(sample_paths[:sample_count])
+                template_payload[0] = {
+                    "coords": template_coords.tolist(),
+                    "stats": template_stats,
+                    "sample_count": sample_count,
+                }
+            except Exception as exc:
+                logging.warning(f"Failed to estimate new RNA rigid template; fallback to configured template. Error: {exc}")
+
+        if accelerator.num_processes > 1:
+            import torch.distributed as dist
+            dist.broadcast_object_list(template_payload, src=0)
+
+        if template_payload[0] is not None:
+            runtime_rna_template = torch.tensor(template_payload[0]["coords"], dtype=torch.float32)
+            _inject_rna_template_into_decoder_configs(
+                decoder_configs,
+                runtime_rna_template,
+                template_payload[0]["stats"],
+            )
+
+            if accelerator.is_main_process:
+                _save_decoder_config(decoder_configs, result_path)
+                logging.info(
+                    "RNA rigid template refreshed from first %d train samples: "
+                    "C4'-C1'=%.6f, C1'-N=%.6f, C4'-N=%.6f (files=%d, residues=%d)",
+                    template_payload[0]["sample_count"],
+                    template_payload[0]["stats"]["c4_c1_mean"],
+                    template_payload[0]["stats"]["c1_n_mean"],
+                    template_payload[0]["stats"]["c4_n_mean"],
+                    template_payload[0]["stats"]["used_files"],
+                    template_payload[0]["stats"]["used_residues"],
+                )
+        else:
+            logging.info("RNA rigid template kept as configured (no new template generated).")
+
     net = prepare_model(
         configs, logging,
         encoder_configs=encoder_configs,
@@ -352,6 +536,11 @@ def main(dict_config, config_file_path):
     logging.info('preparing optimizer is done')
 
     net, start_epoch = load_checkpoints(configs, optimizer, scheduler, logging, net, accelerator)
+    if runtime_rna_template is not None:
+        if _set_runtime_rna_template(net, runtime_rna_template):
+            logging.info("Applied refreshed RNA rigid template to decoder runtime buffer.")
+        else:
+            logging.warning("Could not locate decoder template buffer to apply refreshed RNA rigid template.")
 
     # compile models to train faster and efficiently
     if configs.model.compile_model:

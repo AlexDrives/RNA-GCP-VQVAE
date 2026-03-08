@@ -2,7 +2,11 @@ import torch
 import math
 from typing import Tuple, Optional
 import torch.nn as nn
-from models.gcpnet.layers.structure_proj import Dim6RotStructureHead
+from models.gcpnet.layers.structure_proj import (
+    Dim6RotStructureHead,
+    PROTEIN_BB_COORDINATES,
+    RNA_BB_COORDINATES,
+)
 from models.gcpnet.heads import PairwisePredictionHead, RegressionHead
 from ndlinear import NdLinear
 from x_transformers import ContinuousTransformerWrapper, Encoder
@@ -49,6 +53,12 @@ class GeometricDecoder(nn.Module):
         )
 
         self.direction_loss_bins = decoder_configs.direction_loss_bins
+        self.data_modality = (
+            getattr(configs.train_settings, "data_modality", None)
+            or getattr(configs.train_settings, "modality", None)
+            or getattr(configs, "data_modality", None)
+            or "protein"
+        )
 
         # Store the decoder output scaling factor
         self.decoder_output_scaling_factor = configs.model.decoder_output_scaling_factor
@@ -99,11 +109,23 @@ class GeometricDecoder(nn.Module):
             )
         )
 
+        if str(self.data_modality).lower() == "rna":
+            configured_rna_template = getattr(decoder_configs, "rna_rigid_template_coords", None)
+            if configured_rna_template is not None:
+                template_coords = torch.as_tensor(configured_rna_template, dtype=torch.float32)
+                if template_coords.shape != (3, 3):
+                    raise ValueError("decoder_configs.rna_rigid_template_coords must have shape (3, 3).")
+            else:
+                template_coords = RNA_BB_COORDINATES
+        else:
+            template_coords = PROTEIN_BB_COORDINATES
+
         self.affine_output_projection = Dim6RotStructureHead(
             self.decoder_channels,
             # trans_scale_factor=configs.model.struct_encoder.pos_scale_factor,
             trans_scale_factor=decoder_configs.pos_scale_factor,
             predict_torsion_angles=False,
+            template_coords=template_coords,
         )
 
         if self.enable_pairwise_losses:

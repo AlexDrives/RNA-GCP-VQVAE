@@ -91,7 +91,16 @@ def prepare_model(configs, logger, *, log_details=None, **kwargs):
 
     if not kwargs.get("decoder_only", False):
         if configs.model.encoder.name == "gcpnet":
-            encoder_config_path = os.path.join("configs", "config_gcpnet_encoder.yaml")
+            modality = (
+                getattr(configs.train_settings, "data_modality", None)
+                or getattr(configs.train_settings, "modality", None)
+                or getattr(configs, "data_modality", None)
+                or "protein"
+            )
+            if str(modality).lower() == "rna":
+                encoder_config_path = os.path.join("configs", "config_gcpnet_encoder_rna.yaml")
+            else:
+                encoder_config_path = os.path.join("configs", "config_gcpnet_encoder.yaml")
 
             if configs.model.encoder.pretrained.enabled:
                 encoder = load_pretrained_encoder(
@@ -306,3 +315,4 @@ if __name__ == '__main__':
         output, _, _ = test_model(batch)
         print(output.shape)
         break
+

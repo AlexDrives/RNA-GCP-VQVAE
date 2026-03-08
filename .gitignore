@@ -163,6 +163,7 @@ cython_debug/
 .vscode/
 data/validation/
 log/
+logs/
 models/checkpoints/
 results/
 inference_decode_results
@@ -172,21 +173,33 @@ inference_embed_results
 inference_codebook_extraction_results
 evaluation_results
 
-# all images in root and subdirectories
-**/*.png
-**/*.jpg
-**/*.jpeg
-**/*.gif
-**/*.bmp
-**/*.tiff
-**/*.ico
-**/*.webp
-**/*.svg
-**/*.pdf
+# Local runtime artifacts
+wandb/
+runs/
+outputs/
+tmp/
+temp/
+*.tmp
 
-# all csvs in root and subdirectories
-**/*.csv
+# Model artifacts
+*.pth
+*.pt
+*.ckpt
+*.safetensors
 
-# all txts in root and subdirectories
-**/*.txt
+# Dataset artifacts
+*.h5
+*.hdf5
+data/*_homology_split_*/
+data/*_h5/
+data/*_h5_*/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# NOTE:
+# Do not ignore all images / csv / txt / pdf files globally.
+# README assets, manifests, and documentation files should remain versionable.
+
 utils/source

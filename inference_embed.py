@@ -13,7 +13,12 @@ import h5py
 import numpy as np
 
 from utils.utils import load_configs, load_checkpoints_simple, get_logging
-from data.dataset import GCPNetDataset, custom_collate_pretrained_gcp
+from data.dataset import (
+    GCPNetDataset,
+    GCPNetRNADataset,
+    custom_collate_pretrained_gcp,
+    custom_collate_pretrained_gcp_rna,
+)
 from models.super_model import (
     prepare_model,
     compile_non_gcp_and_exclude_vq,
@@ -44,6 +49,16 @@ def record_embeddings(pids, embeddings_array, indices_tensor, sequences, records
         emb_trim = emb[:L].astype('float32')
         # cleaned = [int(v) for v in ind_list if v != -1]
         records.append({'pid': pid, 'embedding': emb_trim, 'indices': ind_list[:L], 'protein_sequence': seq})
+
+
+def _resolve_modality(configs) -> str:
+    modality = (
+        getattr(configs.train_settings, "data_modality", None)
+        or getattr(configs.train_settings, "modality", None)
+        or getattr(configs, "data_modality", None)
+        or "protein"
+    )
+    return str(modality).lower()
 
 
 def main():
@@ -97,8 +112,12 @@ def main():
         decoder_cfg_path
     )
 
+    modality = _resolve_modality(configs)
+    dataset_cls = GCPNetRNADataset if modality == "rna" else GCPNetDataset
+    collate_base = custom_collate_pretrained_gcp_rna if modality == "rna" else custom_collate_pretrained_gcp
+
     # Prepare dataset and dataloader
-    dataset = GCPNetDataset(
+    dataset = dataset_cls(
         infer_cfg.data_path,
         top_k=encoder_configs.top_k,
         num_positional_embeddings=encoder_configs.num_positional_embeddings,
@@ -107,7 +126,7 @@ def main():
     )
 
     collate_fn = functools.partial(
-        custom_collate_pretrained_gcp,
+        collate_base,
         featuriser=dataset.pretrained_featuriser,
         task_transform=dataset.pretrained_task_transform,
     )

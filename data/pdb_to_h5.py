@@ -29,12 +29,17 @@ def find_structure_files(directory_path, use_cif):
     If use_cif is True, searches for .cif files.
     Otherwise, searches for .pdb files.
     """
+    # 根据use_cif参数确定要搜索的文件类型
+    # 如果use_cif为True，则搜索.cif文件；否则搜索.pdb文件
     patterns = [directory_path + '/**/*.pdb']
     if use_cif:
         patterns = [directory_path + '/**/*.cif']
+    # 用于存储找到的文件列表
     files = []
+    # 遍历所有搜索模式，使用glob.glob进行递归搜索
     for pattern in patterns:
         files.extend(glob.glob(pattern, recursive=True))
+    # 返回找到的所有文件
     return files
 
 

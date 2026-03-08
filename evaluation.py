@@ -13,7 +13,12 @@ import csv
 
 from utils.utils import load_configs, save_backbone_pdb_inference, load_checkpoints_simple, get_logging
 from utils.custom_losses import calculate_aligned_mse_loss
-from data.dataset import GCPNetDataset, custom_collate_pretrained_gcp
+from data.dataset import (
+    GCPNetDataset,
+    GCPNetRNADataset,
+    custom_collate_pretrained_gcp,
+    custom_collate_pretrained_gcp_rna,
+)
 from models.super_model import (
     prepare_model,
     compile_non_gcp_and_exclude_vq,
@@ -48,11 +53,32 @@ def record_indices(pids, indices_tensor, sequences, records):
         records.append({'pid': pid, 'indices': idx[:len(seq)], 'protein_sequence': seq})
 
 
-def save_predictions_to_pdb(pids, preds, masks, pdb_dir):
+def _backbone_atom_names(modality: str):
+    if modality == "rna":
+        return ("C4'", "C1'", "N1/N9")
+    return ("N", "CA", "C")
+
+
+def save_predictions_to_pdb(
+    pids, preds, masks, pdb_dir, atom_names=("N", "CA", "C"), sequences=None
+):
     """Save backbone PDB files for each sample in the batch."""
-    for pid, coord, mask in zip(pids, preds, masks):
+    for idx, (pid, coord, mask) in enumerate(zip(pids, preds, masks)):
         prefix = os.path.join(pdb_dir, pid)
-        save_backbone_pdb_inference(coord, mask, prefix)
+        seq = sequences[idx] if sequences is not None and idx < len(sequences) else None
+        save_backbone_pdb_inference(
+            coord, mask, prefix, atom_names=atom_names, residue_sequence=seq
+        )
+
+
+def _resolve_modality(configs) -> str:
+    modality = (
+        getattr(configs.train_settings, "data_modality", None)
+        or getattr(configs.train_settings, "modality", None)
+        or getattr(configs, "data_modality", None)
+        or "protein"
+    )
+    return str(modality).lower()
 
 
 def evaluate_structures(pdb_dir, original_pdb_dir, result_dir, logger):
@@ -208,8 +234,13 @@ def main():
         decoder_cfg_path
     )
 
+    modality = _resolve_modality(configs)
+    atom_names = _backbone_atom_names(modality)
+    dataset_cls = GCPNetRNADataset if modality == "rna" else GCPNetDataset
+    collate_base = custom_collate_pretrained_gcp_rna if modality == "rna" else custom_collate_pretrained_gcp
+
     # Prepare dataset and dataloader
-    dataset = GCPNetDataset(
+    dataset = dataset_cls(
         infer_cfg.data_path,
         top_k=encoder_configs.top_k,
         num_positional_embeddings=encoder_configs.num_positional_embeddings,
@@ -217,7 +248,7 @@ def main():
         mode='evaluation'
     )
     collate_fn = functools.partial(
-        custom_collate_pretrained_gcp,
+        collate_base,
         featuriser=dataset.pretrained_featuriser,
         task_transform=dataset.pretrained_task_transform,
     )
@@ -307,10 +338,14 @@ def main():
                 alignment_strategy=infer_cfg.get('alignment_strategy', 'kabsch')
             )
             # save PDBs via helper
-            save_predictions_to_pdb(pids, preds_aligned.detach().cpu(), masks.cpu(), pdb_dir)
+            save_predictions_to_pdb(
+                pids, preds_aligned.detach().cpu(), masks.cpu(), pdb_dir, atom_names=atom_names, sequences=sequences
+            )
 
             # The ground truth coordinates are now aligned and can be saved
-            save_predictions_to_pdb(pids, trues_aligned.detach().cpu(), masks.cpu(), original_pdb_dir)
+            save_predictions_to_pdb(
+                pids, trues_aligned.detach().cpu(), masks.cpu(), original_pdb_dir, atom_names=atom_names, sequences=sequences
+            )
 
             # Update progress bar manually
             progress_bar.update(1)
@@ -339,8 +374,17 @@ def main():
                     inds = [inds]
                 writer.writerow([pid, ' '.join(map(str, inds)), seq])
 
-        # Evaluate structures using TM-score and RMSD
-        evaluate_structures(pdb_dir, original_pdb_dir, result_dir, logger)
+        # Evaluate structures using TM-score and RMSD (protein only).
+        if modality == "rna":
+            logger.info("Skipping TM-score evaluation for RNA modality.")
+            summary_path = os.path.join(result_dir, 'evaluation_summary.txt')
+            with open(summary_path, 'w') as f:
+                f.write("RNA evaluation summary\n")
+                f.write("======================\n")
+                f.write("TM-score evaluation was skipped because TMscoring is protein-specific.\n")
+                f.write("Predicted and aligned reference PDB files were generated.\n")
+        else:
+            evaluate_structures(pdb_dir, original_pdb_dir, result_dir, logger)
 
     accelerator.wait_for_everyone()
     accelerator.free_memory()

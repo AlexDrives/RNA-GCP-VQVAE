@@ -262,11 +262,52 @@ class VQVAETransformer(nn.Module):
 
         valid_mask = valid_mask.to(torch.bool)
 
+        if not valid_mask.any() and not (self.tik_tok_enabled and self.latent_token_count > 0):
+            B, L, _ = quantizer_input.shape
+            indices = torch.full((B, L), -1, device=quantizer_input.device, dtype=torch.long)
+            vq_loss = quantizer_input.new_zeros(B)
+            return (
+                quantizer_input,
+                indices,
+                vq_loss,
+                latent_mask_bool,
+                None,
+                None,
+                None,
+                None,
+            )
+
         if self.tik_tok_enabled and self.latent_token_count > 0:
             latent_tokens = quantizer_input[:, self.max_length:, :]
             if latent_mask_bool is None:
                 raise RuntimeError("TikTok latent mask was not created.")
             latent_mask_bool = latent_mask_bool.to(torch.bool)
+
+            if not latent_mask_bool.any():
+                B, L, _ = latent_tokens.shape
+                if self.use_residual_vq:
+                    indices = torch.full(
+                        (B, L, self.residual_depth), -1,
+                        device=latent_tokens.device, dtype=torch.long
+                    )
+                    unflatten_indices = indices
+                    indices = self._flatten_residual_indices(indices)
+                    vq_loss = latent_tokens.new_zeros(B)
+                else:
+                    indices = torch.full((B, L), -1, device=latent_tokens.device, dtype=torch.long)
+                    vq_loss = latent_tokens.new_zeros(B)
+
+                return (
+                    latent_tokens,
+                    indices,
+                    vq_loss,
+                    latent_mask_bool,
+                    None,
+                    None,
+                    unflatten_indices,
+                    latent_counts,
+                )
+
             decoder_input, indices, vq_loss = self.vector_quantizer(
                 latent_tokens,
                 mask=latent_mask_bool,
@@ -693,3 +734,6 @@ class VQVAETransformer(nn.Module):
         scatter_indices = target_pos.unsqueeze(-1).expand_as(embeddings)
         output.scatter_(1, scatter_indices, embeddings)
         return output
+
+
+

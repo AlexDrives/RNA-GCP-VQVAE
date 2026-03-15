@@ -1,0 +1,23 @@
+ssh ymxue@202.121.180.146
+
+source ~/.bashrc
+
+tmux new -s rna
+
+tmux kill-session -t rna
+
+tmux attach -t rna 
+
+conda activate gcpvqvae
+
+
+
+tmux new -s rna_train
+mkdir -p logs
+CUDA_VISIBLE_DEVICES=1 accelerate launch \
+  --num_processes 1 \
+  --num_machines 1 \
+  --mixed_precision bf16 \
+  --dynamo_backend no \
+  train.py --config_path configs/config_vqvae_dihedral.yaml \
+  2>&1 | tee logs/train_af2_rna_$(date +%F_%H-%M-%S).log

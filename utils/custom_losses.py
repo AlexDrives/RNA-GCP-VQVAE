@@ -4,6 +4,7 @@ from utils.alignment import kabsch
 import torch.distributed as dist
 from typing import Optional, Dict, Any
 import torch._functorch.config as functorch_config
+from models.gcpnet.geometry import Affine3D, RotationMatrix
 
 
 def _resolve_data_modality(configs) -> str:
@@ -707,161 +708,299 @@ def calculate_ntp_loss(ntp_logits: Optional[torch.Tensor], indices: Optional[tor
     return per_sample_loss
 
 
+def _affine_from_origin_points(
+    origin: torch.Tensor,
+    x_point: torch.Tensor,
+    xy_point: torch.Tensor,
+    eps: float = 1e-8,
+) -> Affine3D:
+    rotation = RotationMatrix.from_graham_schmidt(
+        x_point - origin,
+        xy_point - origin,
+        eps=eps,
+    )
+    return Affine3D(trans=origin, rot=rotation)
+
+
+
+def _rna_frames_from_coords(coords: torch.Tensor) -> Affine3D:
+    c4 = coords[..., 0, :]
+    c1 = coords[..., 1, :]
+    n_atom = coords[..., 2, :]
+    return _affine_from_origin_points(c1, n_atom, c4)
+
+
+
+def _flatten_rna_points(coords: torch.Tensor) -> torch.Tensor:
+    return coords.reshape(coords.shape[0], -1, 3)
+
+
+
+def _expand_point_mask(valid_mask: torch.Tensor, atoms_per_residue: int) -> torch.Tensor:
+    return valid_mask.unsqueeze(-1).expand(-1, -1, atoms_per_residue).reshape(valid_mask.shape[0], -1)
+
+
+
+def _frame_aligned_point_error(
+    pred_frames: Affine3D,
+    target_frames: Affine3D,
+    frames_mask: torch.Tensor,
+    pred_positions: torch.Tensor,
+    target_positions: torch.Tensor,
+    positions_mask: torch.Tensor,
+    length_scale: float,
+    l1_clamp_distance: Optional[float] = None,
+    eps: float = 1e-8,
+) -> torch.Tensor:
+    local_pred_pos = pred_frames[..., None].invert().apply(pred_positions[:, None, :, :])
+    local_target_pos = target_frames[..., None].invert().apply(target_positions[:, None, :, :])
+
+    local_pred_pos = torch.nan_to_num(local_pred_pos, nan=0.0, posinf=0.0, neginf=0.0)
+    local_target_pos = torch.nan_to_num(local_target_pos, nan=0.0, posinf=0.0, neginf=0.0)
+
+    error_dist = torch.sqrt(torch.sum((local_pred_pos - local_target_pos) ** 2, dim=-1) + eps)
+    if l1_clamp_distance is not None:
+        error_dist = torch.clamp(error_dist, min=0.0, max=l1_clamp_distance)
+
+    frames_mask = frames_mask.to(dtype=error_dist.dtype, device=error_dist.device)
+    positions_mask = positions_mask.to(dtype=error_dist.dtype, device=error_dist.device)
+    combined_mask = frames_mask[..., None] * positions_mask[:, None, :]
+
+    scaled_error = (error_dist / length_scale) * combined_mask
+    denom = combined_mask.sum(dim=(-1, -2)).clamp(min=eps)
+    return scaled_error.sum(dim=(-1, -2)) / denom
+
+
+
+def _compute_rna_fape(
+    pred_frame_tensor: torch.Tensor,
+    pred_coords: torch.Tensor,
+    target_coords: torch.Tensor,
+    valid_mask: torch.Tensor,
+    length_scale: float,
+    l1_clamp_distance: Optional[float],
+) -> torch.Tensor:
+    pred_frames = Affine3D.from_tensor(pred_frame_tensor)
+    target_frames = _rna_frames_from_coords(target_coords)
+
+    pred_positions = _flatten_rna_points(pred_coords)
+    target_positions = _flatten_rna_points(target_coords)
+    positions_mask = _expand_point_mask(valid_mask, pred_coords.shape[-2])
+
+    return _frame_aligned_point_error(
+        pred_frames=pred_frames,
+        target_frames=target_frames,
+        frames_mask=valid_mask,
+        pred_positions=pred_positions,
+        target_positions=target_positions,
+        positions_mask=positions_mask,
+        length_scale=length_scale,
+        l1_clamp_distance=l1_clamp_distance,
+    )
+
+
+
+def _uses_rna_fape_path(output_dict: Dict[str, torch.Tensor]) -> bool:
+    required = ("final_frames", "frame_traj", "coord_traj")
+    return all(key in output_dict for key in required)
+
+
+
 def calculate_decoder_loss(output_dict: Dict[str, torch.Tensor],
                            data: Dict[str, torch.Tensor],
                            configs,
                            alignment_strategy: Optional[str] = None,
                            adaptive_loss_coeffs: Optional[Dict[str, float]] = None):
-    """
-    Compute decoder training/validation losses given model outputs and batch data.
-
-    This function computes both scaled (weighted) and unscaled (raw) loss components for
-    reconstruction-related terms, vector quantization (VQ), and optional next-token
-    prediction (NTP). It also returns aligned coordinate tensors used by metric routines.
-
-    Inputs:
-    - output_dict: Dict[str, Tensor] produced by the model forward pass. Expected keys:
-        'outputs': Tensor of shape (B, L, 9) or (B, L, 3, 3) decoder coordinate predictions.
-        'vq_loss': Scalar tensor (per-batch) VQ commitment/codebook loss.
-        Optional keys for auxiliary losses and metrics:
-          'dir_loss_logits': (B, L, L, 6, 16) for direction classification.
-          'dist_loss_logits': (B, L, L, 64) for distance classification.
-          'ntp_logits': (B, L, K) logits for next-token prediction over K codes.
-          'indices': (B, L) VQ code indices.
-          'valid_mask': (B, L) mask for valid token positions in NTP.
-
-    - data: Dict[str, Tensor] for the current batch. Expected keys:
-        'target_coords': (B, L, 9) or (B, L, 3, 3) target coordinates.
-        'masks': (B, L) residue-validity mask.
-        'nan_masks': (B, L) mask removing positions with NaNs.
-        Optional: 'inverse_folding_labels' (not used here, reserved for extensions).
-
-    - configs: Global configuration object (Hydra/OmegaConf-like) providing:
-        configs.train_settings.losses.* enable flags, weights, and adaptive toggles.
-        configs.train_settings.losses.alignment_strategy: 'kabsch' or 'no'.
-        configs.model.vqvae.vector_quantization.alpha: VQ scaling factor.
-
-    - alignment_strategy: Optional[str]. If None, uses configs.train_settings.losses.alignment_strategy.
-
-    - adaptive_loss_coeffs: Optional[Dict[str, float]] per-loss adaptive multipliers.
-        If None, defaults to 1.0 for all supported losses.
-
-    Returns:
-    - loss_dict: Dict[str, Tensor] containing per-component scaled and unscaled losses and sums:
-        Scaled keys: 'mse_loss', 'backbone_distance_loss', 'backbone_direction_loss',
-                     'binned_direction_classification_loss', 'binned_distance_classification_loss',
-                     'ntp_loss', 'vq_loss', 'rec_loss', 'step_loss'
-        Unscaled keys: 'unscaled_mse_loss', 'unscaled_backbone_distance_loss',
-                       'unscaled_backbone_direction_loss',
-                       'unscaled_binned_direction_classification_loss',
-                       'unscaled_binned_distance_classification_loss',
-                       'unscaled_ntp_loss', 'unscaled_vq_loss', 'unscaled_rec_loss', 'unscaled_step_loss'
-
-    - x_pred_aligned: Tensor of predicted coordinates (B, L, 3, 3)
-    - x_true_aligned: Tensor of aligned true coordinates (B, L, 3, 3)
-    """
-    # Resolve alignment strategy and common tensors
     if alignment_strategy is None:
         alignment_strategy = configs.train_settings.losses.alignment_strategy
 
     data_modality = _resolve_data_modality(configs)
     labels = data['target_coords']
-    masks = torch.logical_and(data['masks'], data['nan_masks']).float()
+    valid_mask = torch.logical_and(data['masks'], data['nan_masks']).to(dtype=torch.bool)
 
-    # Reshape coordinates to (B, L, 3, 3)
     outputs = output_dict['outputs']
     x_predicted = outputs.reshape(outputs.shape[0], outputs.shape[1], 3, 3)
     x_true = labels.reshape(labels.shape[0], labels.shape[1], 3, 3)
+    device = x_predicted.device
 
     dir_loss_logits = output_dict.get('dir_loss_logits', None)
     dist_loss_logits = output_dict.get('dist_loss_logits', None)
     ntp_logits = output_dict.get('ntp_logits', None)
-    vq_loss = output_dict.get('vq_loss', torch.tensor(0.0, device=outputs.device))
+    vq_loss = output_dict.get('vq_loss', torch.tensor(0.0, device=device))
     indices = output_dict.get('indices', None)
     ntp_mask = output_dict.get('ntp_mask', None)
     tik_tok_padding_logits = output_dict.get('tik_tok_padding_logits', None)
     tik_tok_padding_targets = output_dict.get('tik_tok_padding_targets', None)
     alpha = configs.model.vqvae.vector_quantization.alpha
-    # Compute aligned MSE foundation
-    mse_raw, x_pred_aligned, x_true_aligned = calculate_aligned_mse_loss(
-        x_predicted, x_true, masks, alignment_strategy=alignment_strategy)
-    device = x_predicted.device
 
-    # Initialize adaptive coefficients (defaults to 1.0 if not provided)
     adaptive = adaptive_loss_coeffs or {
         'mse': 1.0,
         'backbone_distance': 1.0,
         'backbone_direction': 1.0,
         'binned_direction_classification': 1.0,
         'binned_distance_classification': 1.0,
+        'final_fape': 1.0,
+        'aux_fape': 1.0,
         'ntp': 1.0,
         'vq': 1.0,
         'tik_tok_padding': 1.0,
     }
 
-    # Prepare loss dict with weighted (scaled) and unscaled components
     loss_dict = {}
-    # MSE reconstruction
-    if configs.train_settings.losses.mse.enabled:
-        w = configs.train_settings.losses.mse.weight
-        mse_coeff = adaptive.get('mse', 1.0)
-        mse_unscaled = mse_raw.mean()
-        loss_dict['unscaled_mse_loss'] = mse_unscaled
-        loss_dict['mse_loss'] = mse_unscaled * w * mse_coeff
-    else:
+
+    if _uses_rna_fape_path(output_dict) and data_modality == 'rna':
+        final_fape_cfg = getattr(configs.train_settings.losses, 'final_fape', None)
+        aux_fape_cfg = getattr(configs.train_settings.losses, 'aux_fape', None)
+        final_frames = output_dict['final_frames']
+        frame_traj = output_dict['frame_traj']
+        coord_traj = output_dict['coord_traj']
+
+        length_scale = 10.0
+        clamp_distance = 10.0
+        if final_fape_cfg is not None:
+            length_scale = float(getattr(final_fape_cfg, 'length_scale', length_scale))
+            clamp_distance = getattr(final_fape_cfg, 'clamp_distance', clamp_distance)
+            clamp_distance = None if clamp_distance is None else float(clamp_distance)
+
+        aux_length_scale = length_scale
+        aux_clamp_distance = clamp_distance
+        if aux_fape_cfg is not None:
+            aux_length_scale = float(getattr(aux_fape_cfg, 'length_scale', aux_length_scale))
+            aux_clamp_distance = getattr(aux_fape_cfg, 'clamp_distance', aux_clamp_distance)
+            aux_clamp_distance = None if aux_clamp_distance is None else float(aux_clamp_distance)
+        final_fape_per_sample = _compute_rna_fape(
+            pred_frame_tensor=final_frames,
+            pred_coords=x_predicted,
+            target_coords=x_true,
+            valid_mask=valid_mask,
+            length_scale=length_scale,
+            l1_clamp_distance=clamp_distance,
+        )
+        final_fape_unscaled = final_fape_per_sample.mean()
+
+        aux_fape_per_layer = []
+        for layer_idx in range(frame_traj.shape[1]):
+            aux_fape_per_layer.append(
+                _compute_rna_fape(
+                    pred_frame_tensor=frame_traj[:, layer_idx],
+                    pred_coords=coord_traj[:, layer_idx],
+                    target_coords=x_true,
+                    valid_mask=valid_mask,
+                    length_scale=aux_length_scale,
+                    l1_clamp_distance=aux_clamp_distance,
+                )
+            )
+        aux_fape_stack = torch.stack(aux_fape_per_layer, dim=1)
+        aux_fape_unscaled = aux_fape_stack.mean(dim=1).mean()
+
         zero = torch.tensor(0.0, device=device)
-        loss_dict['unscaled_mse_loss'] = zero
-        loss_dict['mse_loss'] = zero
-    # Backbone distance
-    if configs.train_settings.losses.backbone_distance.enabled:
-        w = configs.train_settings.losses.backbone_distance.weight
-        backbone_distance_coeff = adaptive.get('backbone_distance', 1.0)
-        bd_unscaled = calculate_backbone_distance_loss(
-            x_pred_aligned, x_true_aligned, masks).mean()
-        loss_dict['unscaled_backbone_distance_loss'] = bd_unscaled
-        loss_dict['backbone_distance_loss'] = bd_unscaled * w * backbone_distance_coeff
+        for key in (
+            'mse_loss',
+            'backbone_distance_loss',
+            'backbone_direction_loss',
+            'binned_direction_classification_loss',
+            'binned_distance_classification_loss',
+        ):
+            loss_dict[key] = zero
+        for key in (
+            'unscaled_mse_loss',
+            'unscaled_backbone_distance_loss',
+            'unscaled_backbone_direction_loss',
+            'unscaled_binned_direction_classification_loss',
+            'unscaled_binned_distance_classification_loss',
+        ):
+            loss_dict[key] = zero
+
+        if final_fape_cfg is not None and getattr(final_fape_cfg, 'enabled', False):
+            final_weight = float(getattr(final_fape_cfg, 'weight', 1.0))
+            final_coeff = adaptive.get('final_fape', 1.0)
+            loss_dict['unscaled_final_fape_loss'] = final_fape_unscaled
+            loss_dict['final_fape_loss'] = final_fape_unscaled * final_weight * final_coeff
+        else:
+            loss_dict['unscaled_final_fape_loss'] = zero
+            loss_dict['final_fape_loss'] = zero
+
+        if aux_fape_cfg is not None and getattr(aux_fape_cfg, 'enabled', False):
+            aux_weight = float(getattr(aux_fape_cfg, 'weight', 0.5))
+            aux_coeff = adaptive.get('aux_fape', 1.0)
+            loss_dict['unscaled_aux_fape_loss'] = aux_fape_unscaled
+            loss_dict['aux_fape_loss'] = aux_fape_unscaled * aux_weight * aux_coeff
+        else:
+            loss_dict['unscaled_aux_fape_loss'] = zero
+            loss_dict['aux_fape_loss'] = zero
+
+        x_pred_aligned = x_predicted
+        x_true_aligned = x_true
     else:
+        mse_raw, x_pred_aligned, x_true_aligned = calculate_aligned_mse_loss(
+            x_predicted, x_true, valid_mask.float(), alignment_strategy=alignment_strategy)
+
+        if configs.train_settings.losses.mse.enabled:
+            w = configs.train_settings.losses.mse.weight
+            mse_coeff = adaptive.get('mse', 1.0)
+            mse_unscaled = mse_raw.mean()
+            loss_dict['unscaled_mse_loss'] = mse_unscaled
+            loss_dict['mse_loss'] = mse_unscaled * w * mse_coeff
+        else:
+            zero = torch.tensor(0.0, device=device)
+            loss_dict['unscaled_mse_loss'] = zero
+            loss_dict['mse_loss'] = zero
+
+        if configs.train_settings.losses.backbone_distance.enabled:
+            w = configs.train_settings.losses.backbone_distance.weight
+            backbone_distance_coeff = adaptive.get('backbone_distance', 1.0)
+            bd_unscaled = calculate_backbone_distance_loss(
+                x_pred_aligned, x_true_aligned, valid_mask.float()).mean()
+            loss_dict['unscaled_backbone_distance_loss'] = bd_unscaled
+            loss_dict['backbone_distance_loss'] = bd_unscaled * w * backbone_distance_coeff
+        else:
+            zero = torch.tensor(0.0, device=device)
+            loss_dict['unscaled_backbone_distance_loss'] = zero
+            loss_dict['backbone_distance_loss'] = zero
+
+        if configs.train_settings.losses.backbone_direction.enabled:
+            w = configs.train_settings.losses.backbone_direction.weight
+            backbone_direction_coeff = adaptive.get('backbone_direction', 1.0)
+            bdir_unscaled = calculate_backbone_direction_loss(
+                x_pred_aligned, x_true_aligned, valid_mask.float(), modality=data_modality).mean()
+            loss_dict['unscaled_backbone_direction_loss'] = bdir_unscaled
+            loss_dict['backbone_direction_loss'] = bdir_unscaled * w * backbone_direction_coeff
+        else:
+            zero = torch.tensor(0.0, device=device)
+            loss_dict['unscaled_backbone_direction_loss'] = zero
+            loss_dict['backbone_direction_loss'] = zero
+
+        if configs.train_settings.losses.binned_direction_classification.enabled:
+            w = configs.train_settings.losses.binned_direction_classification.weight
+            binned_direction_coeff = adaptive.get('binned_direction_classification', 1.0)
+            val_unscaled = calculate_binned_direction_classification_loss(
+                dir_loss_logits, x_true_aligned, valid_mask.float(), modality=data_modality
+            ).mean() if dir_loss_logits is not None else torch.tensor(0.0, device=device)
+            loss_dict['unscaled_binned_direction_classification_loss'] = val_unscaled
+            loss_dict['binned_direction_classification_loss'] = val_unscaled * w * binned_direction_coeff
+        else:
+            zero = torch.tensor(0.0, device=device)
+            loss_dict['unscaled_binned_direction_classification_loss'] = zero
+            loss_dict['binned_direction_classification_loss'] = zero
+
+        if configs.train_settings.losses.binned_distance_classification.enabled:
+            w = configs.train_settings.losses.binned_distance_classification.weight
+            binned_distance_coeff = adaptive.get('binned_distance_classification', 1.0)
+            val_unscaled = calculate_binned_distance_classification_loss(
+                dist_loss_logits, x_true_aligned, valid_mask.float(), modality=data_modality
+            ).mean() if dist_loss_logits is not None else torch.tensor(0.0, device=device)
+            loss_dict['unscaled_binned_distance_classification_loss'] = val_unscaled
+            loss_dict['binned_distance_classification_loss'] = val_unscaled * w * binned_distance_coeff
+        else:
+            zero = torch.tensor(0.0, device=device)
+            loss_dict['unscaled_binned_distance_classification_loss'] = zero
+            loss_dict['binned_distance_classification_loss'] = zero
+
         zero = torch.tensor(0.0, device=device)
-        loss_dict['unscaled_backbone_distance_loss'] = zero
-        loss_dict['backbone_distance_loss'] = zero
-    # Backbone direction
-    if configs.train_settings.losses.backbone_direction.enabled:
-        w = configs.train_settings.losses.backbone_direction.weight
-        backbone_direction_coeff = adaptive.get('backbone_direction', 1.0)
-        bdir_unscaled = calculate_backbone_direction_loss(
-            x_pred_aligned, x_true_aligned, masks, modality=data_modality).mean()
-        loss_dict['unscaled_backbone_direction_loss'] = bdir_unscaled
-        loss_dict['backbone_direction_loss'] = bdir_unscaled * w * backbone_direction_coeff
-    else:
-        zero = torch.tensor(0.0, device=device)
-        loss_dict['unscaled_backbone_direction_loss'] = zero
-        loss_dict['backbone_direction_loss'] = zero
-    # Binned direction classification
-    if configs.train_settings.losses.binned_direction_classification.enabled:
-        w = configs.train_settings.losses.binned_direction_classification.weight
-        binned_direction_coeff = adaptive.get('binned_direction_classification', 1.0)
-        val_unscaled = calculate_binned_direction_classification_loss(
-            dir_loss_logits, x_true_aligned, masks, modality=data_modality
-        ).mean() if dir_loss_logits is not None else torch.tensor(0.0, device=device)
-        loss_dict['unscaled_binned_direction_classification_loss'] = val_unscaled
-        loss_dict['binned_direction_classification_loss'] = val_unscaled * w * binned_direction_coeff
-    else:
-        zero = torch.tensor(0.0, device=device)
-        loss_dict['unscaled_binned_direction_classification_loss'] = zero
-        loss_dict['binned_direction_classification_loss'] = zero
-    # Binned distance classification
-    if configs.train_settings.losses.binned_distance_classification.enabled:
-        w = configs.train_settings.losses.binned_distance_classification.weight
-        binned_distance_coeff = adaptive.get('binned_distance_classification', 1.0)
-        val_unscaled = calculate_binned_distance_classification_loss(
-            dist_loss_logits, x_true_aligned, masks, modality=data_modality
-        ).mean() if dist_loss_logits is not None else torch.tensor(0.0, device=device)
-        loss_dict['unscaled_binned_distance_classification_loss'] = val_unscaled
-        loss_dict['binned_distance_classification_loss'] = val_unscaled * w * binned_distance_coeff
-    else:
-        zero = torch.tensor(0.0, device=device)
-        loss_dict['unscaled_binned_distance_classification_loss'] = zero
-        loss_dict['binned_distance_classification_loss'] = zero
+        loss_dict['unscaled_final_fape_loss'] = zero
+        loss_dict['final_fape_loss'] = zero
+        loss_dict['unscaled_aux_fape_loss'] = zero
+        loss_dict['aux_fape_loss'] = zero
 
     if configs.train_settings.losses.next_token_prediction.enabled:
         w = configs.train_settings.losses.next_token_prediction.weight
@@ -887,27 +1026,40 @@ def calculate_decoder_loss(output_dict: Dict[str, torch.Tensor],
         loss_dict['unscaled_tik_tok_padding_loss'] = zero
         loss_dict['tik_tok_padding_loss'] = zero
 
-    # Sum reconstruction components
-    valid_losses = [v for k, v in loss_dict.items() if 'loss' in k and not torch.isnan(v) and k not in ('ntp_loss', 'vq_loss', 'step_loss') and not k.startswith('unscaled_')]
-    if not valid_losses:
-        loss_dict['rec_loss'] = torch.tensor(0.0, device=device)
+    if _uses_rna_fape_path(output_dict) and data_modality == 'rna':
+        rec_keys = [
+            'final_fape_loss',
+            'aux_fape_loss',
+            'tik_tok_padding_loss',
+        ]
+        rec_unscaled_keys = [
+            'unscaled_final_fape_loss',
+            'unscaled_aux_fape_loss',
+            'unscaled_tik_tok_padding_loss',
+        ]
     else:
-        loss_dict['rec_loss'] = sum(valid_losses)
+        rec_keys = [
+            'mse_loss',
+            'backbone_distance_loss',
+            'backbone_direction_loss',
+            'binned_direction_classification_loss',
+            'binned_distance_classification_loss',
+            'tik_tok_padding_loss',
+        ]
+        rec_unscaled_keys = [
+            'unscaled_mse_loss',
+            'unscaled_backbone_distance_loss',
+            'unscaled_backbone_direction_loss',
+            'unscaled_binned_direction_classification_loss',
+            'unscaled_binned_distance_classification_loss',
+            'unscaled_tik_tok_padding_loss',
+        ]
 
-    # Unscaled reconstruction sum (exclude ntp and vq)
-    unscaled_keys = [
-        'unscaled_mse_loss',
-        'unscaled_backbone_distance_loss',
-        'unscaled_backbone_direction_loss',
-        'unscaled_binned_direction_classification_loss',
-        'unscaled_binned_distance_classification_loss',
-        'unscaled_tik_tok_padding_loss',
-    ]
-    unscaled_vals = [loss_dict[k] for k in unscaled_keys if k in loss_dict and not torch.isnan(loss_dict[k])]
-    if not unscaled_vals:
-        loss_dict['unscaled_rec_loss'] = torch.tensor(0.0, device=device)
-    else:
-        loss_dict['unscaled_rec_loss'] = sum(unscaled_vals)
+    valid_losses = [loss_dict[key] for key in rec_keys if key in loss_dict and not torch.isnan(loss_dict[key])]
+    loss_dict['rec_loss'] = sum(valid_losses) if valid_losses else torch.tensor(0.0, device=device)
+
+    valid_unscaled = [loss_dict[key] for key in rec_unscaled_keys if key in loss_dict and not torch.isnan(loss_dict[key])]
+    loss_dict['unscaled_rec_loss'] = sum(valid_unscaled) if valid_unscaled else torch.tensor(0.0, device=device)
 
     vq_coeff = adaptive.get('vq', 1.0)
     loss_dict['unscaled_vq_loss'] = vq_loss
@@ -916,6 +1068,7 @@ def calculate_decoder_loss(output_dict: Dict[str, torch.Tensor],
     loss_dict['step_loss'] = loss_dict['rec_loss'] + loss_dict['vq_loss'] + loss_dict['ntp_loss']
     loss_dict['unscaled_step_loss'] = loss_dict['unscaled_rec_loss'] + loss_dict['unscaled_vq_loss'] + loss_dict['unscaled_ntp_loss']
     return loss_dict, x_pred_aligned, x_true_aligned
+
 
 
 

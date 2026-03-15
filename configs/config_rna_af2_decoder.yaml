@@ -1,0 +1,14 @@
+input_dim: 128
+num_channel: 384
+num_layer: 8
+num_recycle: 3
+num_head: 8
+num_scalar_qk: 16
+num_scalar_v: 16
+num_point_qk: 4
+num_point_v: 8
+dropout: 0.1
+transition_hidden_factor: 4
+share_weights: True
+trans_scale_factor: 10.0
+

@@ -4,6 +4,7 @@ import torch
 import torch.nn as nn
 from models.vqvae import VQVAETransformer
 from models.decoders import GeometricDecoder
+from models.rna_af2_decoder import RNAAF2Decoder
 from models.gcpnet.models.base import (
     instantiate_encoder,
     load_pretrained_encoder,
@@ -75,12 +76,15 @@ class SuperModel(nn.Module):
 
         if kwargs.get('return_vq_layer', False):
             output_dict["embeddings"] = x
+        elif isinstance(x, dict):
+            output_dict.update(x)
+            output_dict.setdefault("dir_loss_logits", None)
+            output_dict.setdefault("dist_loss_logits", None)
         else:
             outputs, dir_loss_logits, dist_loss_logits = x
             output_dict["outputs"] = outputs
             output_dict["dir_loss_logits"] = dir_loss_logits
             output_dict["dist_loss_logits"] = dist_loss_logits
-
 
         return output_dict
 
@@ -127,6 +131,8 @@ def prepare_model(configs, logger, *, log_details=None, **kwargs):
 
     if configs.model.vqvae.decoder.name == "geometric_decoder":
         decoder = GeometricDecoder(configs, decoder_configs=kwargs["decoder_configs"])
+    elif configs.model.vqvae.decoder.name == "rna_af2_decoder":
+        decoder = RNAAF2Decoder(configs, decoder_configs=kwargs["decoder_configs"])
     else:
         raise ValueError("Invalid decoder model specified!")
 
@@ -315,4 +321,6 @@ if __name__ == '__main__':
         output, _, _ = test_model(batch)
         print(output.shape)
         break
+
+
 

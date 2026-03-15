@@ -494,6 +494,13 @@ def prepare_saving_dir(configs, config_file_path):
     return result_path, checkpoint_path
 
 
+
+def get_decoder_config_file_path(decoder_name: str) -> str:
+    if decoder_name == 'geometric_decoder':
+        return os.path.join('configs', 'config_geometric_decoder.yaml')
+    if decoder_name == 'rna_af2_decoder':
+        return os.path.join('configs', 'config_rna_af2_decoder.yaml')
+    raise ValueError('Unknown decoder')
 def load_encoder_decoder_configs(configs, result_path):
     if configs.model.encoder.name == 'gcpnet':
         modality = (
@@ -516,10 +523,7 @@ def load_encoder_decoder_configs(configs, result_path):
 
     shutil.copy(encoder_config_file_path, result_path)
 
-    if configs.model.vqvae.decoder.name == 'geometric_decoder':
-        decoder_config_file_path = os.path.join('configs', 'config_geometric_decoder.yaml')
-    else:
-        raise ValueError('Unknown decoder')
+    decoder_config_file_path = get_decoder_config_file_path(configs.model.vqvae.decoder.name)
 
     with open(decoder_config_file_path) as file:
         decoder_config_file = yaml.full_load(file)
@@ -797,4 +801,7 @@ if __name__ == "__main__":
     atom_masks = torch.ones((n_samps, coordinates.shape[1]))
     save_backbone_pdb(coordinates, atom_masks, pdb_path)
     print(coordinates)
+
+
+
 

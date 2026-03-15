@@ -65,7 +65,7 @@ model:
       num_memory_tokens: 0
       causal: False
     decoder:
-      name: geometric_decoder
+      name: rna_af2_decoder
       freeze_parameters: False
 
 train_settings:
@@ -111,15 +111,15 @@ train_settings:
   losses:
     alignment_strategy: kabsch
     mse:
-      enabled: True
+      enabled: False
       weight: 0.002
       adaptive_coefficient: True
     backbone_distance:
-      enabled: True
+      enabled: False
       weight: 0.03
       adaptive_coefficient: True
     backbone_direction:
-      enabled: True
+      enabled: False
       weight: 0.08
       adaptive_coefficient: True
     binned_distance_classification:
@@ -130,6 +130,16 @@ train_settings:
       enabled: False
       weight: 0.01
       adaptive_coefficient: True
+    final_fape:
+      enabled: True
+      weight: 1.0
+      clamp_distance: 10.0
+      length_scale: 10.0
+    aux_fape:
+      enabled: True
+      weight: 0.5
+      clamp_distance: 10.0
+      length_scale: 10.0
     next_token_prediction:
       enabled: False
       weight: 0.001

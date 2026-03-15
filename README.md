@@ -21,10 +21,12 @@ The active RNA training stack is built around these files:
 - PDB to H5 conversion: [`data/rna_pdb_to_h5.py`](data/rna_pdb_to_h5.py)
 - RNA dataset loader: [`data/dataset.py`](data/dataset.py)
 - RNA encoder config: [`configs/config_gcpnet_encoder_rna.yaml`](configs/config_gcpnet_encoder_rna.yaml)
+- AF2-style RNA decoder config: [`configs/config_rna_af2_decoder.yaml`](configs/config_rna_af2_decoder.yaml)
 - RNA training configs:
   - scratch: [`configs/config_vqvae_dihedral.yaml`](configs/config_vqvae_dihedral.yaml)
   - continue: [`configs/config_vqvae_dihedral_continue.yaml`](configs/config_vqvae_dihedral_continue.yaml)
   - continue + validate every epoch: [`configs/config_vqvae_dihedral_continue_val.yaml`](configs/config_vqvae_dihedral_continue_val.yaml)
+- AF2-style RNA decoder implementation: [`models/rna_af2_decoder.py`](models/rna_af2_decoder.py)
 - training entry: [`train.py`](train.py)
 
 ## Installation
@@ -204,6 +206,7 @@ Edit [`configs/config_vqvae_dihedral.yaml`](configs/config_vqvae_dihedral.yaml):
 - `train_settings.data_path`
 - `valid_settings.data_path`
 - optionally `result_path`
+- decoder hyperparameters such as `num_recycle` live in [`configs/config_rna_af2_decoder.yaml`](configs/config_rna_af2_decoder.yaml)
 
 ### Continue Training
 
@@ -353,34 +356,50 @@ Relevant code:
 
 - dihedral implementation: [`models/gcpnet/features/node_features.py`](models/gcpnet/features/node_features.py)
 
-### 5. RNA decoder template
+### 5. AF2-style RNA structure decoder
 
-5. 解码器使用 RNA 局部模板坐标。
-The decoder uses RNA local template coordinates instead of the protein `[N, CA, C]` template.
+5. 使用 AlphaFold2 风格的 RNA 结构解码器。
+The active RNA scratch config now uses an AF2-inspired structure decoder rather than the original geometric decoder head.
+
+This decoder:
+
+- takes VQ output tokens `(B, L, D)` as the only sequence input
+- initializes one backbone rigid frame per residue
+- applies invariant point attention without pair representation
+- predicts relative rigid updates for each structure block
+- reconstructs RNA local 3-atom rigid coordinates `[C4', C1', N1/N9]`
+- supports configurable recycle passes through `num_recycle` in [`configs/config_rna_af2_decoder.yaml`](configs/config_rna_af2_decoder.yaml)
 
 Relevant code:
 
+- AF2-style decoder config: [`configs/config_rna_af2_decoder.yaml`](configs/config_rna_af2_decoder.yaml)
+- AF2-style decoder implementation: [`models/rna_af2_decoder.py`](models/rna_af2_decoder.py)
 - RNA template constants: [`models/gcpnet/layers/structure_proj.py`](models/gcpnet/layers/structure_proj.py)
-- decoder-side RNA template selection: [`models/decoders.py`](models/decoders.py)
-- runtime replacement with estimated template: [`train.py`](train.py)
+- runtime template replacement with estimated RNA template: [`train.py`](train.py)
 
-### 6. RNA-aware loss branch
+### 6. RNA FAPE loss and AF2-style auxiliary supervision
 
-6. 损失函数按 RNA 模态分支。
-The reconstruction loss stays structurally the same, but direction and pairwise terms branch on `data_modality`.
+6. 损失函数切换为 RNA FAPE 与 AF2 风格辅助监督。
+The active AF2-style RNA decoder path no longer trains with the old `MSE + backbone distance + backbone direction` reconstruction objective in the scratch config.
 
-Current reconstruction loss includes:
+Current reconstruction loss for the AF2-style RNA decoder includes:
 
-- MSE
-- backbone distance loss
-- backbone direction loss
-- optional binned direction classification loss
-- optional binned distance classification loss
+- final backbone FAPE loss
+- auxiliary backbone FAPE loss over all intermediate structure-block trajectories
 - optional TikTok padding loss
+- VQ loss is still added separately at the training step level
+
+Here, the AF2-style auxiliary loss means:
+
+- every intermediate frame trajectory produced by the RNA structure decoder is supervised with backbone FAPE
+- this is analogous to AlphaFold2 trajectory supervision
+- it is not the protein-specific torsion / chi / violation loss stack
 
 Relevant code:
 
 - reconstruction loss assembly: [`utils/custom_losses.py`](utils/custom_losses.py)
+- AF2-style decoder outputs consumed by the loss: [`models/rna_af2_decoder.py`](models/rna_af2_decoder.py)
+- scratch config enabling `final_fape` and `aux_fape`: [`configs/config_vqvae_dihedral.yaml`](configs/config_vqvae_dihedral.yaml)
 
 ## Minimal End-to-End Workflow
 

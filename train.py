@@ -14,7 +14,9 @@ from utils.utils import (
     prepare_optimizer,
     prepare_tensorboard,
     save_checkpoint,
-    load_encoder_decoder_configs)
+    load_encoder_decoder_configs,
+    get_decoder_config_file_path,
+)
 from accelerate import Accelerator, DataLoaderConfiguration
 from accelerate.utils import InitProcessGroupKwargs, DistributedDataParallelKwargs
 from datetime import timedelta
@@ -86,8 +88,11 @@ def _inject_rna_template_into_decoder_configs(decoder_configs, template_coords, 
     decoder_configs.rna_rigid_template_source = "estimated_from_training_data"
 
 
-def _save_decoder_config(decoder_configs, result_path):
-    decoder_cfg_path = os.path.join(result_path, "config_geometric_decoder.yaml")
+def _save_decoder_config(decoder_configs, result_path, decoder_name):
+    decoder_cfg_path = os.path.join(
+        result_path,
+        os.path.basename(get_decoder_config_file_path(decoder_name)),
+    )
     with open(decoder_cfg_path, "w") as f:
         yaml.safe_dump(decoder_configs.to_dict(), f, sort_keys=False)
 
@@ -159,9 +164,16 @@ def _estimate_rna_template_from_paths(sample_paths):
 
 def _set_runtime_rna_template(net, template_coords):
     decoder = getattr(getattr(net, "vqvae", None), "decoder", None)
-    if decoder is None or not hasattr(decoder, "affine_output_projection"):
+    if decoder is None:
         return False
-    buffer = decoder.affine_output_projection.template_coords
+
+    if hasattr(decoder, "template_coords"):
+        buffer = decoder.template_coords
+    elif hasattr(decoder, "affine_output_projection") and hasattr(decoder.affine_output_projection, "template_coords"):
+        buffer = decoder.affine_output_projection.template_coords
+    else:
+        return False
+
     buffer.copy_(template_coords.to(device=buffer.device, dtype=buffer.dtype))
     return True
 
@@ -511,7 +523,7 @@ def main(dict_config, config_file_path):
             )
 
             if accelerator.is_main_process:
-                _save_decoder_config(decoder_configs, result_path)
+                _save_decoder_config(decoder_configs, result_path, configs.model.vqvae.decoder.name)
                 logging.info(
                     "RNA rigid template refreshed from first %d train samples: "
                     "C4'-C1'=%.6f, C1'-N=%.6f, C4'-N=%.6f (files=%d, residues=%d)",
@@ -741,3 +753,6 @@ if __name__ == '__main__':
         config_file = yaml.full_load(file)
 
     main(config_file, config_path)
+
+
+

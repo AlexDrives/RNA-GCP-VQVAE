@@ -208,6 +208,12 @@ Edit [`configs/config_vqvae_dihedral.yaml`](configs/config_vqvae_dihedral.yaml):
 - optionally `result_path`
 - decoder hyperparameters such as `num_recycle` live in [`configs/config_rna_af2_decoder.yaml`](configs/config_rna_af2_decoder.yaml)
 
+Current repository default:
+
+当前仓库默认值：
+- `train_settings.data_path: /data/ymxue/p2_rnavqvae/alex/data/bgsu_h5_homology_split_c80/splits/train`
+- `valid_settings.data_path: /data/ymxue/p2_rnavqvae/alex/data/bgsu_h5_homology_split_c80/splits/val`
+
 ### Continue Training
 
 Edit [`configs/config_vqvae_dihedral_continue.yaml`](configs/config_vqvae_dihedral_continue.yaml):
@@ -281,13 +287,34 @@ Example single-GPU command:
 
 单卡示例命令：
 ```bash
-CUDA_VISIBLE_DEVICES=0 accelerate launch \
+CUDA_VISIBLE_DEVICES=2 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True accelerate launch \
   --num_processes 1 \
   --num_machines 1 \
   --mixed_precision bf16 \
   --dynamo_backend no \
-  train.py --config_path configs/config_vqvae_dihedral_continue_val.yaml
+  train.py --config_path configs/config_vqvae_dihedral.yaml
 ```
+
+Example with log capture:
+
+带日志保存的示例命令：
+```bash
+mkdir -p logs
+
+CUDA_VISIBLE_DEVICES=2 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True accelerate launch \
+  --num_processes 1 \
+  --num_machines 1 \
+  --mixed_precision bf16 \
+  --dynamo_backend no \
+  train.py --config_path configs/config_vqvae_dihedral.yaml 2>&1 | tee logs/dihedral_$(date +%F_%H-%M-%S).log
+```
+
+Memory note:
+
+显存说明：
+- the RNA AF2-style decoder plus RNA FAPE supervision can be tight on a 24 GB RTX 3090
+- if you hit CUDA OOM, reduce `train_settings.batch_size` first
+- if needed, reduce `num_recycle` in [`configs/config_rna_af2_decoder.yaml`](configs/config_rna_af2_decoder.yaml)
 
 ## What Changed For RNA
 

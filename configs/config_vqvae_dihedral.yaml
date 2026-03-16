@@ -72,7 +72,7 @@ train_settings:
   data_modality: rna
   new_rigid: True
   new_rigid_max_samples: 100
-  data_path: /data/ymxue/p2_rnavqvae/alex/data/rnasolo_h5_homology_split_c80/splits/train
+  data_path: /data/ymxue/p2_rnavqvae/alex/data/bgsu_h5_homology_split_c80/splits/train
   num_epochs: 40
   sample_weighting:
     enabled: True
@@ -82,7 +82,7 @@ train_settings:
   shuffle: True
   mixed_precision: bf16
   save_pdb_every: 999999
-  batch_size: 4
+  batch_size: 2
   num_workers: 4
   grad_accumulation: 1
   max_task_samples: 100000
@@ -149,7 +149,7 @@ train_settings:
       adaptive_coefficient: False
 
 valid_settings:
-  data_path: /data/ymxue/p2_rnavqvae/alex/data/rnasolo_h5_homology_split_c80/splits/val
+  data_path: /data/ymxue/p2_rnavqvae/alex/data/bgsu_h5_homology_split_c80/splits/val
   # Keep validation off as in stage1/stage2 to avoid the known validation crash.
   do_every: 999999
   save_pdb_every: 999999

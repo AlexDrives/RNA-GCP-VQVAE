@@ -751,24 +751,41 @@ def _frame_aligned_point_error(
     length_scale: float,
     l1_clamp_distance: Optional[float] = None,
     eps: float = 1e-8,
+    point_chunk_size: int = 128,
 ) -> torch.Tensor:
-    local_pred_pos = pred_frames[..., None].invert().apply(pred_positions[:, None, :, :])
-    local_target_pos = target_frames[..., None].invert().apply(target_positions[:, None, :, :])
+    if point_chunk_size <= 0:
+        raise ValueError("point_chunk_size must be a positive integer")
 
-    local_pred_pos = torch.nan_to_num(local_pred_pos, nan=0.0, posinf=0.0, neginf=0.0)
-    local_target_pos = torch.nan_to_num(local_target_pos, nan=0.0, posinf=0.0, neginf=0.0)
+    inv_pred_frames = pred_frames[..., None].invert()
+    inv_target_frames = target_frames[..., None].invert()
 
-    error_dist = torch.sqrt(torch.sum((local_pred_pos - local_target_pos) ** 2, dim=-1) + eps)
-    if l1_clamp_distance is not None:
-        error_dist = torch.clamp(error_dist, min=0.0, max=l1_clamp_distance)
+    frames_mask = frames_mask.to(dtype=pred_positions.dtype, device=pred_positions.device)
+    positions_mask = positions_mask.to(dtype=pred_positions.dtype, device=pred_positions.device)
+    denom = (frames_mask[..., None] * positions_mask[:, None, :]).sum(dim=(-1, -2)).clamp(min=eps)
 
-    frames_mask = frames_mask.to(dtype=error_dist.dtype, device=error_dist.device)
-    positions_mask = positions_mask.to(dtype=error_dist.dtype, device=error_dist.device)
-    combined_mask = frames_mask[..., None] * positions_mask[:, None, :]
+    error_sum = torch.zeros_like(denom)
+    num_points = pred_positions.shape[1]
 
-    scaled_error = (error_dist / length_scale) * combined_mask
-    denom = combined_mask.sum(dim=(-1, -2)).clamp(min=eps)
-    return scaled_error.sum(dim=(-1, -2)) / denom
+    for start in range(0, num_points, point_chunk_size):
+        end = min(start + point_chunk_size, num_points)
+
+        pred_chunk = pred_positions[:, None, start:end, :]
+        target_chunk = target_positions[:, None, start:end, :]
+
+        local_pred_pos = inv_pred_frames.apply(pred_chunk)
+        local_target_pos = inv_target_frames.apply(target_chunk)
+
+        local_pred_pos = torch.nan_to_num(local_pred_pos, nan=0.0, posinf=0.0, neginf=0.0)
+        local_target_pos = torch.nan_to_num(local_target_pos, nan=0.0, posinf=0.0, neginf=0.0)
+
+        error_dist = torch.sqrt(torch.sum((local_pred_pos - local_target_pos) ** 2, dim=-1) + eps)
+        if l1_clamp_distance is not None:
+            error_dist = torch.clamp(error_dist, min=0.0, max=l1_clamp_distance)
+
+        chunk_mask = frames_mask[..., None] * positions_mask[:, None, start:end]
+        error_sum = error_sum + ((error_dist / length_scale) * chunk_mask).sum(dim=(-1, -2))
+
+    return error_sum / denom
 
 
 
@@ -779,6 +796,7 @@ def _compute_rna_fape(
     valid_mask: torch.Tensor,
     length_scale: float,
     l1_clamp_distance: Optional[float],
+    point_chunk_size: int = 128,
 ) -> torch.Tensor:
     pred_frames = Affine3D.from_tensor(pred_frame_tensor)
     target_frames = _rna_frames_from_coords(target_coords)
@@ -796,6 +814,7 @@ def _compute_rna_fape(
         positions_mask=positions_mask,
         length_scale=length_scale,
         l1_clamp_distance=l1_clamp_distance,
+        point_chunk_size=point_chunk_size,
     )
 
 

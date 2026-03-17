@@ -1,7 +1,6 @@
 input_dim: 128
 num_channel: 384
 num_layer: 8
-num_recycle: 3
 num_head: 8
 num_scalar_qk: 16
 num_scalar_v: 16

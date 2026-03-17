@@ -206,7 +206,7 @@ Edit [`configs/config_vqvae_dihedral.yaml`](configs/config_vqvae_dihedral.yaml):
 - `train_settings.data_path`
 - `valid_settings.data_path`
 - optionally `result_path`
-- decoder hyperparameters such as `num_recycle` live in [`configs/config_rna_af2_decoder.yaml`](configs/config_rna_af2_decoder.yaml)
+- decoder hyperparameters such as `num_layer` and `share_weights` live in [`configs/config_rna_af2_decoder.yaml`](configs/config_rna_af2_decoder.yaml)
 
 Current repository default:
 
@@ -314,7 +314,7 @@ Memory note:
 显存说明：
 - the RNA AF2-style decoder plus RNA FAPE supervision can be tight on a 24 GB RTX 3090
 - if you hit CUDA OOM, reduce `train_settings.batch_size` first
-- if needed, reduce `num_recycle` in [`configs/config_rna_af2_decoder.yaml`](configs/config_rna_af2_decoder.yaml)
+- if needed, reduce `num_layer` in [`configs/config_rna_af2_decoder.yaml`](configs/config_rna_af2_decoder.yaml)
 
 ## What Changed For RNA
 
@@ -395,7 +395,7 @@ This decoder:
 - applies invariant point attention without pair representation
 - predicts relative rigid updates for each structure block
 - reconstructs RNA local 3-atom rigid coordinates `[C4', C1', N1/N9]`
-- supports configurable recycle passes through `num_recycle` in [`configs/config_rna_af2_decoder.yaml`](configs/config_rna_af2_decoder.yaml)
+- runs `num_layer` structure blocks, with optional shared weights controlled by `share_weights` in [`configs/config_rna_af2_decoder.yaml`](configs/config_rna_af2_decoder.yaml)
 
 Relevant code:
 

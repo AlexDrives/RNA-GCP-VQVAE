@@ -227,7 +227,6 @@ class RNAAF2Decoder(nn.Module):
         self.input_dim = int(getattr(decoder_configs, "input_dim", configs.model.vqvae.vector_quantization.dim))
         self.num_channel = int(decoder_configs.num_channel)
         self.num_layer = int(decoder_configs.num_layer)
-        self.num_recycle = int(getattr(decoder_configs, "num_recycle", 3))
         self.share_weights = bool(getattr(decoder_configs, "share_weights", True))
 
         configured_rna_template = getattr(decoder_configs, "rna_rigid_template_coords", None)
@@ -269,6 +268,12 @@ class RNAAF2Decoder(nn.Module):
         pred_xyz = frames[..., None].apply(coords_local)
         return pred_xyz * valid_mask.unsqueeze(-1).unsqueeze(-1).to(pred_xyz.dtype)
 
+    def _stop_rotation_gradient(self, frames: Affine3D) -> Affine3D:
+        # Match AF2's affine.apply_rotation_tensor_fn(stop_gradient): keep using
+        # the updated frame geometry, but prevent later blocks from backpropagating
+        # through the current rotation tensor.
+        return Affine3D(trans=frames.trans, rot=frames.rot.detach())
+
     def forward(
         self,
         structure_tokens: torch.Tensor,
@@ -290,12 +295,14 @@ class RNAAF2Decoder(nn.Module):
         frame_traj = []
         coord_traj = []
 
-        for _ in range(self.num_recycle + 1):
-            for block in self._iter_blocks():
-                single_repr, frames = block(single_repr, frames, valid_mask)
-                coords = self._coords_from_frames(frames, valid_mask)
-                frame_traj.append(_affine_to_matrix(frames))
-                coord_traj.append(coords)
+        # Match AF2 structure module semantics: run the fold block num_layer times,
+        # optionally reusing the same block weights, without an extra recycle loop.
+        for block in self._iter_blocks():
+            single_repr, frames = block(single_repr, frames, valid_mask)
+            coords = self._coords_from_frames(frames, valid_mask)
+            frame_traj.append(_affine_to_matrix(frames))
+            coord_traj.append(coords)
+            frames = self._stop_rotation_gradient(frames)
 
         final_frames = frame_traj[-1]
         outputs = coord_traj[-1]
@@ -305,7 +312,7 @@ class RNAAF2Decoder(nn.Module):
             "final_frames": final_frames,
             "frame_traj": torch.stack(frame_traj, dim=1),
             "coord_traj": torch.stack(coord_traj, dim=1),
-            "num_recycles": self.num_recycle,
+            "num_recycles": 0,
             "dir_loss_logits": None,
             "dist_loss_logits": None,
         }

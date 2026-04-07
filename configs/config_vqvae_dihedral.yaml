@@ -43,7 +43,7 @@ model:
       kmeans_iters: 30
       stochastic_sample_codes: False
       sample_codebook_temp: 0.1
-      alpha: 0.15
+      alpha: 1.00
       tik_tok:
         enabled: False
         compression_factor: 8
@@ -105,6 +105,7 @@ train_settings:
     probability: 0.5
   random_rotation:
     enabled: False
+  progress_update_every: 50
   gradient_norm_logging_freq: 50
   log_separate_grad_norms: False
   adaptive_loss_coefficient: False

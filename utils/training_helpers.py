@@ -362,6 +362,7 @@ def progress_postfix(optimizer, loss_dict: Dict[str, torch.Tensor], global_step:
         'step_loss': float(loss_dict['step_loss'].detach().item()),
         'rec_loss': float(loss_dict['rec_loss'].detach().item()),
         'vq_loss': float(loss_dict['vq_loss'].detach().item()) if 'vq_loss' in loss_dict else float('nan'),
+        'vq_raw': float(loss_dict['unscaled_vq_loss'].detach().item()) if 'unscaled_vq_loss' in loss_dict else float('nan'),
         'global_step': int(global_step),
     }
 

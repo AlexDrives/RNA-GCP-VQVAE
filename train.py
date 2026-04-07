@@ -2,6 +2,7 @@ import argparse
 import numpy as np
 import yaml
 import os
+import sys
 import torch
 import math
 from utils.custom_losses import calculate_decoder_loss, log_per_loss_grad_norms
@@ -74,6 +75,15 @@ def _new_rigid_max_samples(configs) -> int:
     else:
         value = getattr(configs.train_settings, "new_rigid_max_samples", 100)
     return max(int(value), 1)
+
+
+def _progress_update_every(configs) -> int:
+    value = getattr(configs.train_settings, "progress_update_every", 20)
+    return max(int(value), 1)
+
+
+def _use_tqdm_progress(configs) -> bool:
+    return bool(configs.tqdm_progress_bar and sys.stderr.isatty())
 
 
 def _inject_rna_template_into_decoder_configs(decoder_configs, template_coords, stats):
@@ -191,6 +201,8 @@ def train_loop(net, train_loader, epoch, adaptive_loss_coeffs, **kwargs):
     codebook_size = configs.model.vqvae.vector_quantization.codebook_size
     accum_iter = configs.train_settings.grad_accumulation
     alignment_strategy = configs.train_settings.losses.alignment_strategy
+    progress_update_every = _progress_update_every(configs)
+    use_tqdm = _use_tqdm_progress(configs) and accelerator.is_main_process
 
     # Initialize metrics and accumulators
     metrics = init_metrics(configs, accelerator)
@@ -202,7 +214,7 @@ def train_loop(net, train_loader, epoch, adaptive_loss_coeffs, **kwargs):
 
     # Initialize the progress bar using tqdm
     progress_bar = tqdm(range(0, int(np.ceil(len(train_loader) / accum_iter))),
-                        leave=False, disable=not (configs.tqdm_progress_bar and accelerator.is_main_process))
+                        leave=False, disable=not use_tqdm)
     progress_bar.set_description(f"Epoch {epoch}")
 
     net.train()
@@ -234,6 +246,13 @@ def train_loop(net, train_loader, epoch, adaptive_loss_coeffs, **kwargs):
                 # Use the mean sample weight for the batch (could be weighted by batch size)
                 batch_weight = sample_weights.mean()
                 loss_dict['rec_loss'] = loss_dict['rec_loss'] * batch_weight
+                loss_dict['unscaled_rec_loss'] = loss_dict['unscaled_rec_loss'] * batch_weight
+                loss_dict['step_loss'] = loss_dict['rec_loss'] + loss_dict['vq_loss'] + loss_dict['ntp_loss']
+                loss_dict['unscaled_step_loss'] = (
+                    loss_dict['unscaled_rec_loss']
+                    + loss_dict['unscaled_vq_loss']
+                    + loss_dict['unscaled_ntp_loss']
+                )
 
             # Log per-loss gradient norms and adjust adaptive coefficients
             adaptive_loss_coeffs = log_per_loss_grad_norms(
@@ -284,15 +303,29 @@ def train_loop(net, train_loader, epoch, adaptive_loss_coeffs, **kwargs):
                 if accelerator.is_main_process and configs.tensorboard_log:
                     writer.add_scalar('lr', optimizer.param_groups[0]['lr'], global_step)
 
-                avgs = average_losses(acc)
-                progress_bar.set_description(f"epoch {epoch} "
-                                             + f"[loss: {avgs['avg_unscaled_step_loss']:.3f}, "
-                                             + f"rec loss: {avgs['avg_unscaled_rec_loss']:.3f}, "
-                                             + f"vq loss: {avgs['avg_unscaled_vq_loss']:.3f}]")
-
-            progress_bar.set_postfix(
-                progress_postfix(optimizer, loss_dict, global_step)
-            )
+                if global_step % progress_update_every == 0 or global_step == 1:
+                    avgs = average_losses(acc)
+                    if use_tqdm:
+                        progress_bar.set_description(f"epoch {epoch} "
+                                                     + f"[loss: {avgs['avg_unscaled_step_loss']:.3f}, "
+                                                     + f"rec loss: {avgs['avg_unscaled_rec_loss']:.3f}, "
+                                                     + f"vq raw: {avgs['avg_unscaled_vq_loss']:.3f}, "
+                                                     + f"vq scaled: {avgs['avg_vq_loss']:.3f}]")
+                        progress_bar.set_postfix(
+                            progress_postfix(optimizer, loss_dict, global_step)
+                        )
+                    elif accelerator.is_main_process:
+                        logging.info(
+                            "epoch %d step %d/%d - loss %.3f rec %.3f vq_raw %.3f vq_scaled %.3f lr %.2e",
+                            epoch,
+                            global_step,
+                            int(np.ceil(len(train_loader) / accum_iter)),
+                            avgs['avg_unscaled_step_loss'],
+                            avgs['avg_unscaled_rec_loss'],
+                            avgs['avg_unscaled_vq_loss'],
+                            avgs['avg_vq_loss'],
+                            optimizer.param_groups[0]['lr'],
+                        )
 
     # Compute average losses and metrics
     avgs = average_losses(acc)
@@ -343,6 +376,8 @@ def valid_loop(net, valid_loader, epoch, **kwargs):
     codebook_size = configs.model.vqvae.vector_quantization.codebook_size
     alignment_strategy = configs.train_settings.losses.alignment_strategy
     atom_names = _backbone_atom_names(configs)
+    progress_update_every = _progress_update_every(configs)
+    use_tqdm = _use_tqdm_progress(configs) and accelerator.is_main_process
 
     # Initialize metrics and accumulators for validation
     metrics = init_metrics(configs, accelerator)
@@ -352,7 +387,7 @@ def valid_loop(net, valid_loader, epoch, **kwargs):
 
     # Initialize the progress bar using tqdm
     progress_bar = tqdm(range(0, int(len(valid_loader))),
-                        leave=False, disable=not (configs.tqdm_progress_bar and accelerator.is_main_process))
+                        leave=False, disable=not use_tqdm)
     progress_bar.set_description(f"Validation epoch {epoch}")
 
     net.eval()
@@ -393,11 +428,23 @@ def valid_loop(net, valid_loader, epoch, **kwargs):
             finalize_step(acc)
 
         progress_bar.update(1)
-        avgs = average_losses(acc)
-        progress_bar.set_description(f"validation epoch {epoch} "
-                                     + f"[loss: {avgs['avg_unscaled_step_loss']:.3f}, "
-                                     + f"rec loss: {avgs['avg_unscaled_rec_loss']:.3f}, "
-                                     + f"vq loss: {avgs['avg_unscaled_vq_loss']:.3f}]")
+        if (i + 1) % progress_update_every == 0 or (i + 1) == len(valid_loader):
+            avgs = average_losses(acc)
+            if use_tqdm:
+                progress_bar.set_description(f"validation epoch {epoch} "
+                                             + f"[loss: {avgs['avg_unscaled_step_loss']:.3f}, "
+                                             + f"rec loss: {avgs['avg_unscaled_rec_loss']:.3f}, "
+                                             + f"vq raw: {avgs['avg_unscaled_vq_loss']:.3f}]")
+            elif accelerator.is_main_process:
+                logging.info(
+                    "validation epoch %d step %d/%d - loss %.3f rec %.3f vq_raw %.3f",
+                    epoch,
+                    i + 1,
+                    len(valid_loader),
+                    avgs['avg_unscaled_step_loss'],
+                    avgs['avg_unscaled_rec_loss'],
+                    avgs['avg_unscaled_vq_loss'],
+                )
 
     # Compute averages and metrics
     avgs = average_losses(acc)

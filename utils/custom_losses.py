@@ -948,8 +948,12 @@ def calculate_decoder_loss(output_dict: Dict[str, torch.Tensor],
             loss_dict['unscaled_aux_fape_loss'] = zero
             loss_dict['aux_fape_loss'] = zero
 
-        x_pred_aligned = x_predicted
-        x_true_aligned = x_true
+        # Keep RNA FAPE as the training objective, but align the returned
+        # coordinates for logging / metric computation so RMSD, MAE, and the
+        # proxy TM-score reflect the configured alignment strategy.
+        _, x_pred_aligned, x_true_aligned = calculate_aligned_mse_loss(
+            x_predicted, x_true, valid_mask.float(), alignment_strategy=alignment_strategy
+        )
     else:
         mse_raw, x_pred_aligned, x_true_aligned = calculate_aligned_mse_loss(
             x_predicted, x_true, valid_mask.float(), alignment_strategy=alignment_strategy)

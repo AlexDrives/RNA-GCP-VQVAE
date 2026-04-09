@@ -110,6 +110,7 @@ train_settings:
   log_separate_grad_norms: False
   adaptive_loss_coefficient: False
   losses:
+    # Retained for legacy analysis utilities; the active RNA FAPE path tracks raw-frame loss.
     alignment_strategy: kabsch
     mse:
       enabled: False
@@ -151,9 +152,10 @@ train_settings:
 
 valid_settings:
   data_path: /data/ymxue/p2_rnavqvae/alex/data/bgsu_h5_homology_split_c80/splits/val
-  # Keep validation off as in stage1/stage2 to avoid the known validation crash.
-  do_every: 999999
-  save_pdb_every: 999999
+  # Active RNA path tracks the validation loss every epoch.
+  do_every: 1
+  # Export the first validation batch each epoch for offline/local PyMOL playback.
+  save_pdb_every: 1
   batch_size: 1
   num_workers: 0
 

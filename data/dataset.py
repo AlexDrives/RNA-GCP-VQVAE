@@ -1451,7 +1451,7 @@ if __name__ == '__main__':
 
     # from utils.metrics import batch_distance_map_to_coordinates
 
-    config_path = "../configs/config_vqvae.yaml"
+    config_path = "../configs/config_vqvae_dihedral.yaml"
 
     print('Loading config file:', config_path)
     with open(config_path) as file:

@@ -8,6 +8,7 @@ num_point_qk: 4
 num_point_v: 8
 dropout: 0.1
 transition_hidden_factor: 4
+# Weight tying across structure blocks; this is not AF2 recycling.
 share_weights: True
 trans_scale_factor: 10.0
 

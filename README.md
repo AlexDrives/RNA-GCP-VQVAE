@@ -29,6 +29,12 @@ The active RNA training stack is built around these files:
 - AF2-style RNA decoder implementation: [`models/rna_af2_decoder.py`](models/rna_af2_decoder.py)
 - training entry: [`train.py`](train.py)
 
+The config directory has been trimmed around this active RNA path:
+
+- the `config_vqvae*` family now keeps only the dihedral series above
+- generic or older experimental `config_vqvae*.yaml` variants were removed
+- inference and evaluation configs were updated to point to the dihedral + RNA AF2 decoder stack
+
 ## Installation
 
 安装说明。
@@ -207,6 +213,8 @@ Edit [`configs/config_vqvae_dihedral.yaml`](configs/config_vqvae_dihedral.yaml):
 - `valid_settings.data_path`
 - optionally `result_path`
 - decoder hyperparameters such as `num_layer` and `share_weights` live in [`configs/config_rna_af2_decoder.yaml`](configs/config_rna_af2_decoder.yaml)
+- validation now runs every epoch by default through `valid_settings.do_every: 1`
+- validation PDB export is enabled by default through `valid_settings.save_pdb_every: 1`
 
 Current repository default:
 
@@ -223,6 +231,11 @@ Edit [`configs/config_vqvae_dihedral_continue.yaml`](configs/config_vqvae_dihedr
 - `resume.resume_path`
 - optionally `result_path`
 
+This config now matches the same active RNA decoder/loss stack as scratch training:
+
+- decoder: `rna_af2_decoder`
+- reconstruction losses: `final_fape + aux_fape + vq`
+
 ### Continue Training With Validation Every Epoch
 
 Edit [`configs/config_vqvae_dihedral_continue_val.yaml`](configs/config_vqvae_dihedral_continue_val.yaml):
@@ -236,6 +249,8 @@ This file already sets:
 
 这个配置已经默认设置：
 - `valid_settings.do_every: 1`
+
+It also uses the same AF2-style RNA decoder and FAPE-based loss stack as the other dihedral configs.
 
 So it is the config to use when you want to continue training and run validation every epoch.
 
@@ -397,6 +412,11 @@ This decoder:
 - reconstructs RNA local 3-atom rigid coordinates `[C4', C1', N1/N9]`
 - runs `num_layer` structure blocks, with optional shared weights controlled by `share_weights` in [`configs/config_rna_af2_decoder.yaml`](configs/config_rna_af2_decoder.yaml)
 
+Important clarification:
+
+- `share_weights=True` means weight tying across structure blocks
+- this is not AlphaFold2 recycling
+
 Relevant code:
 
 - AF2-style decoder config: [`configs/config_rna_af2_decoder.yaml`](configs/config_rna_af2_decoder.yaml)
@@ -407,7 +427,7 @@ Relevant code:
 ### 6. RNA FAPE loss and AF2-style auxiliary supervision
 
 6. 损失函数切换为 RNA FAPE 与 AF2 风格辅助监督。
-The active AF2-style RNA decoder path no longer trains with the old `MSE + backbone distance + backbone direction` reconstruction objective in the scratch config.
+The active dihedral config path no longer trains with the old `MSE + backbone distance + backbone direction` reconstruction objective.
 
 Current reconstruction loss for the AF2-style RNA decoder includes:
 
@@ -415,6 +435,17 @@ Current reconstruction loss for the AF2-style RNA decoder includes:
 - auxiliary backbone FAPE loss over all intermediate structure-block trajectories
 - optional TikTok padding loss
 - VQ loss is still added separately at the training step level
+
+Training/validation monitoring in the active RNA path is now loss-first:
+
+- best checkpoints are selected by validation loss
+- epoch logs emphasize `loss`, `rec_loss`, `final_fape`, `aux_fape`, and `vq_loss`
+- the old MAE / RMSD / TM-score / GDT-TS training-time metrics are no longer the primary monitoring path
+
+Memory note:
+
+- the current RNA FAPE implementation is chunked for memory safety
+- this is intentional for single-GPU 24 GB class cards such as RTX 3090 / 3080 setups
 
 Here, the AF2-style auxiliary loss means:
 
@@ -426,7 +457,22 @@ Relevant code:
 
 - reconstruction loss assembly: [`utils/custom_losses.py`](utils/custom_losses.py)
 - AF2-style decoder outputs consumed by the loss: [`models/rna_af2_decoder.py`](models/rna_af2_decoder.py)
-- scratch config enabling `final_fape` and `aux_fape`: [`configs/config_vqvae_dihedral.yaml`](configs/config_vqvae_dihedral.yaml)
+- dihedral configs enabling `final_fape` and `aux_fape`:
+  - [`configs/config_vqvae_dihedral.yaml`](configs/config_vqvae_dihedral.yaml)
+  - [`configs/config_vqvae_dihedral_continue.yaml`](configs/config_vqvae_dihedral_continue.yaml)
+  - [`configs/config_vqvae_dihedral_continue_val.yaml`](configs/config_vqvae_dihedral_continue_val.yaml)
+
+### 7. Validation exports and PyMOL playback
+
+7. 验证导出与 PyMOL 回放。
+For server-side training, the repository now assumes offline visualization rather than a live GUI window.
+
+The intended workflow is:
+
+- training periodically writes validation prediction / label PDBs
+- the exported structures stay in the original coordinate frame
+- the label PDB is no longer rewritten after Kabsch alignment
+- you can sync those files back to a local machine and inspect the same validation sample across epochs in PyMOL
 
 ## Minimal End-to-End Workflow
 

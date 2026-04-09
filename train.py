@@ -204,7 +204,7 @@ def train_loop(net, train_loader, epoch, adaptive_loss_coeffs, **kwargs):
     progress_update_every = _progress_update_every(configs)
     use_tqdm = _use_tqdm_progress(configs) and accelerator.is_main_process
 
-    # Initialize metrics and accumulators
+    # Initialize optional auxiliary metrics and accumulators
     metrics = init_metrics(configs, accelerator)
     acc = init_accumulator(accum_iter)
 
@@ -228,7 +228,6 @@ def train_loop(net, train_loader, epoch, adaptive_loss_coeffs, **kwargs):
 
             masks = torch.logical_and(data['masks'], data['nan_masks'])
 
-            optimizer.zero_grad()
             output_dict = net(data)
 
             # Compute the loss components (function unwraps tensors internally)
@@ -245,6 +244,17 @@ def train_loop(net, train_loader, epoch, adaptive_loss_coeffs, **kwargs):
                 sample_weights = data['sample_weights']
                 # Use the mean sample weight for the batch (could be weighted by batch size)
                 batch_weight = sample_weights.mean()
+                for key in (
+                    'final_fape_loss',
+                    'aux_fape_loss',
+                    'mse_loss',
+                    'backbone_distance_loss',
+                    'backbone_direction_loss',
+                    'binned_direction_classification_loss',
+                    'binned_distance_classification_loss',
+                ):
+                    if key in loss_dict:
+                        loss_dict[key] = loss_dict[key] * batch_weight
                 loss_dict['rec_loss'] = loss_dict['rec_loss'] * batch_weight
                 loss_dict['unscaled_rec_loss'] = loss_dict['unscaled_rec_loss'] * batch_weight
                 loss_dict['step_loss'] = loss_dict['rec_loss'] + loss_dict['vq_loss'] + loss_dict['ntp_loss']
@@ -274,7 +284,7 @@ def train_loop(net, train_loader, epoch, adaptive_loss_coeffs, **kwargs):
                                   residue_sequences=data['seq'])
                 logging.info("PDB files are built")
 
-            # Update metrics and accumulators
+            # Update optional metrics and accumulators
             update_metrics(metrics, trans_pred_coords, trans_true_coords, masks, output_dict, ignore_index=-100)
             accumulate_losses(acc, loss_dict, output_dict, configs, accelerator, use_output_vq=False)
             update_unique_indices(acc, output_dict["indices"], accelerator)
@@ -294,6 +304,7 @@ def train_loop(net, train_loader, epoch, adaptive_loss_coeffs, **kwargs):
 
                 optimizer.step()
                 scheduler.step()
+                optimizer.zero_grad()
 
                 progress_bar.update(1)
                 global_step += 1
@@ -309,6 +320,8 @@ def train_loop(net, train_loader, epoch, adaptive_loss_coeffs, **kwargs):
                         progress_bar.set_description(f"epoch {epoch} "
                                                      + f"[loss: {avgs['avg_unscaled_step_loss']:.3f}, "
                                                      + f"rec loss: {avgs['avg_unscaled_rec_loss']:.3f}, "
+                                                     + f"fape: {avgs['avg_unscaled_final_fape_loss']:.3f}, "
+                                                     + f"aux: {avgs['avg_unscaled_aux_fape_loss']:.3f}, "
                                                      + f"vq raw: {avgs['avg_unscaled_vq_loss']:.3f}, "
                                                      + f"vq scaled: {avgs['avg_vq_loss']:.3f}]")
                         progress_bar.set_postfix(
@@ -316,12 +329,14 @@ def train_loop(net, train_loader, epoch, adaptive_loss_coeffs, **kwargs):
                         )
                     elif accelerator.is_main_process:
                         logging.info(
-                            "epoch %d step %d/%d - loss %.3f rec %.3f vq_raw %.3f vq_scaled %.3f lr %.2e",
+                            "epoch %d step %d/%d - loss %.3f rec %.3f final_fape %.3f aux_fape %.3f vq_raw %.3f vq_scaled %.3f lr %.2e",
                             epoch,
                             global_step,
                             int(np.ceil(len(train_loader) / accum_iter)),
                             avgs['avg_unscaled_step_loss'],
                             avgs['avg_unscaled_rec_loss'],
+                            avgs['avg_unscaled_final_fape_loss'],
+                            avgs['avg_unscaled_aux_fape_loss'],
                             avgs['avg_unscaled_vq_loss'],
                             avgs['avg_vq_loss'],
                             optimizer.param_groups[0]['lr'],
@@ -351,12 +366,10 @@ def train_loop(net, train_loader, epoch, adaptive_loss_coeffs, **kwargs):
     return_dict = {
         "loss": avgs['avg_unscaled_step_loss'],
         "rec_loss": avgs['avg_unscaled_rec_loss'],
+        "final_fape_loss": avgs['avg_unscaled_final_fape_loss'],
+        "aux_fape_loss": avgs['avg_unscaled_aux_fape_loss'],
         "ntp_loss": avgs['avg_unscaled_ntp_loss'],
         "vq_loss": avgs['avg_unscaled_vq_loss'],
-        "mae": metrics_values['mae'],
-        "rmsd": metrics_values['rmsd'],
-        "gdtts": metrics_values['gdtts'],
-        "tm_score": metrics_values['tm_score'],
         "perplexity": metrics_values['perplexity'],
         "padding_accuracy": metrics_values.get('tik_tok_padding_accuracy', float('nan')),
         "activation": np.round(avg_activation * 100, 1),
@@ -379,7 +392,7 @@ def valid_loop(net, valid_loader, epoch, **kwargs):
     progress_update_every = _progress_update_every(configs)
     use_tqdm = _use_tqdm_progress(configs) and accelerator.is_main_process
 
-    # Initialize metrics and accumulators for validation
+    # Initialize optional metrics and accumulators for validation
     metrics = init_metrics(configs, accelerator)
     acc = init_accumulator(accum_iter=1)
 
@@ -421,9 +434,9 @@ def valid_loop(net, valid_loader, epoch, **kwargs):
                                   residue_sequences=data['seq'])
                 logging.info("PDB files are built")
 
-            # Update metrics and losses
+            # Update optional metrics and losses
             update_metrics(metrics, trans_pred_coords, trans_true_coords, masks, output_dict, ignore_index=-100)
-            accumulate_losses(acc, loss_dict, output_dict, configs, accelerator, use_output_vq=True)
+            accumulate_losses(acc, loss_dict, output_dict, configs, accelerator, use_output_vq=False)
             # Finalize this validation step so totals/averages are updated
             finalize_step(acc)
 
@@ -434,15 +447,19 @@ def valid_loop(net, valid_loader, epoch, **kwargs):
                 progress_bar.set_description(f"validation epoch {epoch} "
                                              + f"[loss: {avgs['avg_unscaled_step_loss']:.3f}, "
                                              + f"rec loss: {avgs['avg_unscaled_rec_loss']:.3f}, "
+                                             + f"fape: {avgs['avg_unscaled_final_fape_loss']:.3f}, "
+                                             + f"aux: {avgs['avg_unscaled_aux_fape_loss']:.3f}, "
                                              + f"vq raw: {avgs['avg_unscaled_vq_loss']:.3f}]")
             elif accelerator.is_main_process:
                 logging.info(
-                    "validation epoch %d step %d/%d - loss %.3f rec %.3f vq_raw %.3f",
+                    "validation epoch %d step %d/%d - loss %.3f rec %.3f final_fape %.3f aux_fape %.3f vq_raw %.3f",
                     epoch,
                     i + 1,
                     len(valid_loader),
                     avgs['avg_unscaled_step_loss'],
                     avgs['avg_unscaled_rec_loss'],
+                    avgs['avg_unscaled_final_fape_loss'],
+                    avgs['avg_unscaled_aux_fape_loss'],
                     avgs['avg_unscaled_vq_loss'],
                 )
 
@@ -470,12 +487,10 @@ def valid_loop(net, valid_loader, epoch, **kwargs):
     return_dict = {
         "loss": avgs['avg_unscaled_step_loss'],
         "rec_loss": avgs['avg_unscaled_rec_loss'],
+        "final_fape_loss": avgs['avg_unscaled_final_fape_loss'],
+        "aux_fape_loss": avgs['avg_unscaled_aux_fape_loss'],
         "vq_loss": avgs['avg_unscaled_vq_loss'],
         "ntp_loss": avgs['avg_unscaled_ntp_loss'],
-        "mae": metrics_values['mae'],
-        "rmsd": metrics_values['rmsd'],
-        "gdtts": metrics_values['gdtts'],
-        "tm_score": metrics_values['tm_score'],
         "perplexity": metrics_values['perplexity'],
         "padding_accuracy": metrics_values.get('tik_tok_padding_accuracy', float('nan')),
         "activation": np.round(avg_activation * 100, 1),
@@ -656,12 +671,11 @@ def main(dict_config, config_file_path):
     }
 
     best_valid_metrics = {
-        'gdtts': 0.0,
-        'mae': 1000.0,
-        'rmsd': 1000.0,
-        'lddt': 0.0,
-        'loss': 1000.0,
-        'tm_score': 0.0,
+        'loss': float('inf'),
+        'rec_loss': float('inf'),
+        'final_fape_loss': float('inf'),
+        'aux_fape_loss': float('inf'),
+        'vq_loss': float('inf'),
         'perplexity': 1000.0,
         'padding_accuracy': 0.0,
     }
@@ -686,10 +700,8 @@ def main(dict_config, config_file_path):
             f'epoch {epoch} ({training_loop_reports["counter"]} steps) - time {np.round(training_time, 2)}s, '
             f'global steps {training_loop_reports["global_step"]}, loss {training_loop_reports["loss"]:.4f}, '
             f'rec loss {training_loop_reports["rec_loss"]:.4f}, '
-            f'mae {training_loop_reports["mae"]:.4f}, '
-            f'rmsd {training_loop_reports["rmsd"]:.4f}, '
-            f'gdtts {training_loop_reports["gdtts"]:.4f}, '
-            f'tm_score {training_loop_reports["tm_score"]:.4f}, '
+            f'final fape {training_loop_reports["final_fape_loss"]:.4f}, '
+            f'aux fape {training_loop_reports["aux_fape_loss"]:.4f}, '
             f'ntp loss {training_loop_reports["ntp_loss"]:.4f}, '
             f'perplexity {training_loop_reports.get("perplexity", float("nan")):.2f}, '
             f'padding acc {training_loop_reports.get("padding_accuracy", float("nan")):.4f}, '
@@ -731,10 +743,8 @@ def main(dict_config, config_file_path):
                 f'validation epoch {epoch} ({valid_loop_reports["counter"]} steps) - time {np.round(valid_time, 2)}s, '
                 f'loss {valid_loop_reports["loss"]:.4f}, '
                 f'rec loss {valid_loop_reports["rec_loss"]:.4f}, '
-                f'mae {valid_loop_reports["mae"]:.4f}, '
-                f'rmsd {valid_loop_reports["rmsd"]:.4f}, '
-                f'gdtts {valid_loop_reports["gdtts"]:.4f}, '
-                f'tm_score {valid_loop_reports["tm_score"]:.4f}, '
+                f'final fape {valid_loop_reports["final_fape_loss"]:.4f}, '
+                f'aux fape {valid_loop_reports["aux_fape_loss"]:.4f}, '
                 f'ntp loss {valid_loop_reports["ntp_loss"]:.4f}, '
                 f'perplexity {valid_loop_reports.get("perplexity", float("nan")):.2f}, '
                 f'padding acc {valid_loop_reports.get("padding_accuracy", float("nan")):.4f}, '
@@ -743,13 +753,13 @@ def main(dict_config, config_file_path):
                 # f'lddt {valid_loop_reports["lddt"]:.4f}'
             )
 
-            # Check valid metric to save the best model
-            if valid_loop_reports["rmsd"] < best_valid_metrics['rmsd']:
-                best_valid_metrics['gdtts'] = valid_loop_reports["gdtts"]
-                best_valid_metrics['mae'] = valid_loop_reports["mae"]
-                best_valid_metrics['rmsd'] = valid_loop_reports["rmsd"]
+            # Save the best model based on the active validation objective.
+            if valid_loop_reports["loss"] < best_valid_metrics['loss']:
                 best_valid_metrics['loss'] = valid_loop_reports["loss"]
-                best_valid_metrics['tm_score'] = valid_loop_reports["tm_score"]
+                best_valid_metrics['rec_loss'] = valid_loop_reports["rec_loss"]
+                best_valid_metrics['final_fape_loss'] = valid_loop_reports["final_fape_loss"]
+                best_valid_metrics['aux_fape_loss'] = valid_loop_reports["aux_fape_loss"]
+                best_valid_metrics['vq_loss'] = valid_loop_reports["vq_loss"]
                 best_valid_metrics['perplexity'] = valid_loop_reports.get("perplexity", float("nan"))
                 best_valid_metrics['padding_accuracy'] = valid_loop_reports.get("padding_accuracy", float("nan"))
 
@@ -765,18 +775,20 @@ def main(dict_config, config_file_path):
                 save_checkpoint(epoch, model_path, accelerator, net=net, optimizer=optimizer, scheduler=scheduler,
                                 configs=configs)
                 logging.info(f'\tsaving the best models in {model_path}')
-                logging.info(f'\tbest valid rmsd: {best_valid_metrics["rmsd"]:.4f}')
+                logging.info(f'\tbest valid loss: {best_valid_metrics["loss"]:.4f}')
 
     logging.info("Training is completed!\n")
 
-    # log best valid gdtts
-    logging.info(f"best valid gdtts: {best_valid_metrics['gdtts']:.4f}")
-    logging.info(f"best valid tm_score: {best_valid_metrics['tm_score']:.4f}")
-    logging.info(f"best valid rmsd: {best_valid_metrics['rmsd']:.4f}")
-    logging.info(f"best valid mae: {best_valid_metrics['mae']:.4f}")
-    logging.info(f"best valid perplexity: {best_valid_metrics['perplexity']:.2f}")
-    logging.info(f"best valid padding accuracy: {best_valid_metrics['padding_accuracy']:.4f}")
-    logging.info(f"best valid loss: {best_valid_metrics['loss']:.4f}")
+    if np.isfinite(best_valid_metrics['loss']):
+        logging.info(f"best valid rec loss: {best_valid_metrics['rec_loss']:.4f}")
+        logging.info(f"best valid final fape: {best_valid_metrics['final_fape_loss']:.4f}")
+        logging.info(f"best valid aux fape: {best_valid_metrics['aux_fape_loss']:.4f}")
+        logging.info(f"best valid vq loss: {best_valid_metrics['vq_loss']:.4f}")
+        logging.info(f"best valid perplexity: {best_valid_metrics['perplexity']:.2f}")
+        logging.info(f"best valid padding accuracy: {best_valid_metrics['padding_accuracy']:.4f}")
+        logging.info(f"best valid loss: {best_valid_metrics['loss']:.4f}")
+    else:
+        logging.info("best valid metrics unavailable because validation did not run.")
 
     if accelerator.is_main_process:
         train_writer.close()
@@ -792,7 +804,7 @@ def main(dict_config, config_file_path):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Train a VQ-VAE models.")
     parser.add_argument("--config_path", "-c", help="The location of config file",
-                        default='./configs/config_vqvae.yaml')
+                        default='./configs/config_vqvae_dihedral.yaml')
     args = parser.parse_args()
     config_path = args.config_path
 

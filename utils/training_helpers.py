@@ -1,27 +1,23 @@
 import torch
 import torchmetrics
 from typing import Dict, Any, Optional, cast
-from utils.metrics import GDTTS, TMScore, update_perplexity_from_ntp
+from utils.metrics import update_perplexity_from_ntp
 
 
 def init_metrics(configs, accelerator) -> Dict[str, Any]:
-    """Initialize metric objects used in training/validation.
+    """Initialize optional auxiliary metrics used in training/validation.
 
     Args:
         configs: Hydrated config object with loss toggles (NTP, TikTok).
         accelerator: ``accelerate.Accelerator`` whose device hosts the metrics.
 
     Returns:
-        Dict[str, Any]: A dictionary of metric instances keyed by name. Always
-        includes ``mae``, ``rmsd``, ``gdtts`` and ``tm_score``; optionally
-        includes ``perplexity`` (when next-token prediction is enabled) and
-        ``tik_tok_padding_accuracy`` (when the TikTok classifier is enabled).
+        Dict[str, Any]: Optional metric instances keyed by name. Coordinate
+        metrics are intentionally omitted because the active RNA objective is
+        tracked directly through loss terms. Only language-model style metrics
+        remain when their heads are enabled.
     """
     metrics: Dict[str, Any] = {
-        'mae': torchmetrics.MeanAbsoluteError().to(accelerator.device),
-        'rmsd': torchmetrics.MeanSquaredError(squared=False).to(accelerator.device),
-        'gdtts': GDTTS().to(accelerator.device),
-        'tm_score': TMScore().to(accelerator.device),
         'perplexity': None,
         'tik_tok_padding_accuracy': None,
     }
@@ -52,10 +48,6 @@ def reset_metrics(metrics: Dict[str, Any]) -> None:
     Args:
         metrics: Dict returned by :func:`init_metrics`.
     """
-    metrics['mae'].reset()
-    metrics['rmsd'].reset()
-    metrics['gdtts'].reset()
-    metrics['tm_score'].reset()
     if metrics.get('perplexity') is not None:
         metrics['perplexity'].reset()
     if metrics.get('tik_tok_padding_accuracy') is not None:
@@ -68,7 +60,7 @@ def update_metrics(metrics: Dict[str, Any],
                    masks: torch.Tensor,
                    output_dict: Dict[str, torch.Tensor],
                    ignore_index: int = -100) -> None:
-    """Update metric states with a new batch.
+    """Update optional auxiliary metric states with a new batch.
 
     Args:
         metrics: Dict returned by :func:`init_metrics`.
@@ -80,24 +72,11 @@ def update_metrics(metrics: Dict[str, Any],
         ignore_index: Index ignored when computing perplexity.
 
     Notes:
-        - Always updates MAE/RMSD/GDTTS/TM-score.
+        - Coordinate metrics are intentionally disabled in the active RNA path.
         - Updates perplexity when the metric exists and NTP outputs are present.
         - Updates padding-accuracy when the TikTok metric exists and logits / targets are available.
     """
-    # Coordinate-based metrics (MAE/RMSD/GDTTS)
-    if masks.any():
-        masked_outputs = trans_pred_coords[masks].reshape(-1, 3)
-        masked_labels = trans_true_coords[masks].reshape(-1, 3)
-        if masked_outputs.numel() > 0:
-            metrics['mae'].update(masked_outputs.detach(), masked_labels.detach())
-            metrics['rmsd'].update(masked_outputs.detach(), masked_labels.detach())
-            # GDTTS expects backbone points (we feed masked points)
-            metrics['gdtts'].update(masked_outputs.detach(), masked_labels.detach())
-
-    # TM-Score: use C-alpha coordinates and original masks; metric handles masking
-    pred_ca_coords = trans_pred_coords[:, :, 1, :].detach()
-    true_ca_coords = trans_true_coords[:, :, 1, :].detach()
-    metrics['tm_score'].update(pred_ca_coords, true_ca_coords, masks.detach().bool())
+    del trans_pred_coords, trans_true_coords, masks
 
     # Optional perplexity from NTP
     if metrics.get('perplexity') is not None:
@@ -124,15 +103,10 @@ def compute_metrics(metrics: Dict[str, Any]) -> Dict[str, float]:
         metrics: Dict returned by :func:`init_metrics`.
 
     Returns:
-        Dict[str, float]: Contains ``mae``, ``rmsd``, ``gdtts``, ``tm_score`` and
-        optionally ``perplexity`` / ``tik_tok_padding_accuracy``. Metrics that
-        were not enabled are reported as ``NaN``.
+        Dict[str, float]: Optional non-structural metrics. Metrics that were not
+        enabled are reported as ``NaN``.
     """
     out = {
-        'mae': metrics['mae'].compute().cpu().item(),
-        'rmsd': metrics['rmsd'].compute().cpu().item(),
-        'gdtts': metrics['gdtts'].compute().cpu().item(),
-        'tm_score': metrics['tm_score'].compute().cpu().item(),
         'perplexity': float('nan'),
         'tik_tok_padding_accuracy': float('nan'),
     }
@@ -157,24 +131,32 @@ def init_accumulator(accum_iter: int) -> Dict[str, Any]:
         # per-accumulation running values (averaged per micro-step)
         'train_step_loss': 0.0,
         'train_rec_loss': 0.0,
+        'train_final_fape_loss': 0.0,
+        'train_aux_fape_loss': 0.0,
         'train_vq_loss': 0.0,
         'train_ntp_loss': 0.0,
         'train_tik_tok_padding_loss': 0.0,
         # unscaled per-accumulation running values
         'train_unscaled_step_loss': 0.0,
         'train_unscaled_rec_loss': 0.0,
+        'train_unscaled_final_fape_loss': 0.0,
+        'train_unscaled_aux_fape_loss': 0.0,
         'train_unscaled_vq_loss': 0.0,
         'train_unscaled_ntp_loss': 0.0,
         'train_unscaled_tik_tok_padding_loss': 0.0,
         # totals across finalized steps
         'total_step_loss': 0.0,
         'total_rec_loss': 0.0,
+        'total_final_fape_loss': 0.0,
+        'total_aux_fape_loss': 0.0,
         'total_vq_loss': 0.0,
         'total_ntp_loss': 0.0,
         'total_tik_tok_padding_loss': 0.0,
         # unscaled totals across finalized steps
         'total_unscaled_step_loss': 0.0,
         'total_unscaled_rec_loss': 0.0,
+        'total_unscaled_final_fape_loss': 0.0,
+        'total_unscaled_aux_fape_loss': 0.0,
         'total_unscaled_vq_loss': 0.0,
         'total_unscaled_ntp_loss': 0.0,
         'total_unscaled_tik_tok_padding_loss': 0.0,
@@ -228,9 +210,17 @@ def accumulate_losses(acc: Dict[str, Any],
     bs = configs.train_settings.batch_size
     acc['train_step_loss'] += _gather_mean(accelerator, loss_dict['step_loss'], repeat=bs).item() / acc['accum_iter']
     acc['train_rec_loss'] += _gather_mean(accelerator, loss_dict['rec_loss'], repeat=bs).item() / acc['accum_iter']
-    # vq loss source differs between train and valid in original code
-    vq_src = output_dict['vq_loss'] if use_output_vq else loss_dict['vq_loss']
+    # Validation and training should use the same scaled VQ term for logging.
+    vq_src = loss_dict['vq_loss']
     acc['train_vq_loss'] += _gather_mean(accelerator, vq_src, repeat=bs).item() / acc['accum_iter']
+    if 'final_fape_loss' in loss_dict and loss_dict['final_fape_loss'] is not None:
+        acc['train_final_fape_loss'] += _gather_mean(
+            accelerator, loss_dict['final_fape_loss'], repeat=bs
+        ).item() / acc['accum_iter']
+    if 'aux_fape_loss' in loss_dict and loss_dict['aux_fape_loss'] is not None:
+        acc['train_aux_fape_loss'] += _gather_mean(
+            accelerator, loss_dict['aux_fape_loss'], repeat=bs
+        ).item() / acc['accum_iter']
     # ntp loss may be missing; default to zero
     if 'ntp_loss' in loss_dict and loss_dict['ntp_loss'] is not None:
         acc['train_ntp_loss'] += _gather_mean(accelerator, loss_dict['ntp_loss'], repeat=bs).item() / acc['accum_iter']
@@ -247,9 +237,16 @@ def accumulate_losses(acc: Dict[str, Any],
     if 'unscaled_rec_loss' in loss_dict:
         acc['train_unscaled_rec_loss'] += _gather_mean(accelerator, loss_dict['unscaled_rec_loss'], repeat=bs).item() / acc['accum_iter']
     if 'unscaled_vq_loss' in loss_dict:
-        # vq unscaled source mirrors scaled behavior when validating (taken from output)
-        unscaled_vq_src = output_dict['vq_loss'] if use_output_vq else loss_dict['unscaled_vq_loss']
+        unscaled_vq_src = loss_dict['unscaled_vq_loss']
         acc['train_unscaled_vq_loss'] += _gather_mean(accelerator, unscaled_vq_src, repeat=bs).item() / acc['accum_iter']
+    if 'unscaled_final_fape_loss' in loss_dict and loss_dict['unscaled_final_fape_loss'] is not None:
+        acc['train_unscaled_final_fape_loss'] += _gather_mean(
+            accelerator, loss_dict['unscaled_final_fape_loss'], repeat=bs
+        ).item() / acc['accum_iter']
+    if 'unscaled_aux_fape_loss' in loss_dict and loss_dict['unscaled_aux_fape_loss'] is not None:
+        acc['train_unscaled_aux_fape_loss'] += _gather_mean(
+            accelerator, loss_dict['unscaled_aux_fape_loss'], repeat=bs
+        ).item() / acc['accum_iter']
     if 'unscaled_ntp_loss' in loss_dict and loss_dict['unscaled_ntp_loss'] is not None:
         acc['train_unscaled_ntp_loss'] += _gather_mean(accelerator, loss_dict['unscaled_ntp_loss'], repeat=bs).item() / acc['accum_iter']
     if 'unscaled_tik_tok_padding_loss' in loss_dict and loss_dict['unscaled_tik_tok_padding_loss'] is not None:
@@ -268,24 +265,32 @@ def finalize_step(acc: Dict[str, Any]) -> None:
     """
     acc['total_step_loss'] += acc['train_step_loss']
     acc['total_rec_loss'] += acc['train_rec_loss']
+    acc['total_final_fape_loss'] += acc['train_final_fape_loss']
+    acc['total_aux_fape_loss'] += acc['train_aux_fape_loss']
     acc['total_vq_loss'] += acc['train_vq_loss']
     acc['total_ntp_loss'] += acc['train_ntp_loss']
     acc['total_tik_tok_padding_loss'] += acc['train_tik_tok_padding_loss']
 
     acc['total_unscaled_step_loss'] += acc['train_unscaled_step_loss']
     acc['total_unscaled_rec_loss'] += acc['train_unscaled_rec_loss']
+    acc['total_unscaled_final_fape_loss'] += acc['train_unscaled_final_fape_loss']
+    acc['total_unscaled_aux_fape_loss'] += acc['train_unscaled_aux_fape_loss']
     acc['total_unscaled_vq_loss'] += acc['train_unscaled_vq_loss']
     acc['total_unscaled_ntp_loss'] += acc['train_unscaled_ntp_loss']
     acc['total_unscaled_tik_tok_padding_loss'] += acc['train_unscaled_tik_tok_padding_loss']
 
     acc['train_step_loss'] = 0.0
     acc['train_rec_loss'] = 0.0
+    acc['train_final_fape_loss'] = 0.0
+    acc['train_aux_fape_loss'] = 0.0
     acc['train_vq_loss'] = 0.0
     acc['train_ntp_loss'] = 0.0
     acc['train_tik_tok_padding_loss'] = 0.0
 
     acc['train_unscaled_step_loss'] = 0.0
     acc['train_unscaled_rec_loss'] = 0.0
+    acc['train_unscaled_final_fape_loss'] = 0.0
+    acc['train_unscaled_aux_fape_loss'] = 0.0
     acc['train_unscaled_vq_loss'] = 0.0
     acc['train_unscaled_ntp_loss'] = 0.0
     acc['train_unscaled_tik_tok_padding_loss'] = 0.0
@@ -307,11 +312,15 @@ def average_losses(acc: Dict[str, Any]) -> Dict[str, float]:
     return {
         'avg_step_loss': acc['total_step_loss'] / denom,
         'avg_rec_loss': acc['total_rec_loss'] / denom,
+        'avg_final_fape_loss': acc['total_final_fape_loss'] / denom,
+        'avg_aux_fape_loss': acc['total_aux_fape_loss'] / denom,
         'avg_vq_loss': acc['total_vq_loss'] / denom,
         'avg_ntp_loss': acc['total_ntp_loss'] / denom,
         'avg_tik_tok_padding_loss': acc['total_tik_tok_padding_loss'] / denom,
         'avg_unscaled_step_loss': acc['total_unscaled_step_loss'] / denom,
         'avg_unscaled_rec_loss': acc['total_unscaled_rec_loss'] / denom,
+        'avg_unscaled_final_fape_loss': acc['total_unscaled_final_fape_loss'] / denom,
+        'avg_unscaled_aux_fape_loss': acc['total_unscaled_aux_fape_loss'] / denom,
         'avg_unscaled_vq_loss': acc['total_unscaled_vq_loss'] / denom,
         'avg_unscaled_ntp_loss': acc['total_unscaled_ntp_loss'] / denom,
         'avg_unscaled_tik_tok_padding_loss': acc['total_unscaled_tik_tok_padding_loss'] / denom,
@@ -394,6 +403,8 @@ def log_tensorboard_epoch(writer,
 
     writer.add_scalar('loss/total', avgs['avg_step_loss'], epoch)
     writer.add_scalar('loss/rec_loss', avgs['avg_rec_loss'], epoch)
+    writer.add_scalar('loss/final_fape', avgs['avg_final_fape_loss'], epoch)
+    writer.add_scalar('loss/aux_fape', avgs['avg_aux_fape_loss'], epoch)
     writer.add_scalar('loss/vq', avgs['avg_vq_loss'], epoch)
     if 'avg_tik_tok_padding_loss' in avgs:
         writer.add_scalar('loss/tik_tok_padding', avgs['avg_tik_tok_padding_loss'], epoch)
@@ -405,6 +416,10 @@ def log_tensorboard_epoch(writer,
         writer.add_scalar('unscaled_loss/total', avgs['avg_unscaled_step_loss'], epoch)
     if 'avg_unscaled_rec_loss' in avgs:
         writer.add_scalar('unscaled_loss/rec_loss', avgs['avg_unscaled_rec_loss'], epoch)
+    if 'avg_unscaled_final_fape_loss' in avgs:
+        writer.add_scalar('unscaled_loss/final_fape', avgs['avg_unscaled_final_fape_loss'], epoch)
+    if 'avg_unscaled_aux_fape_loss' in avgs:
+        writer.add_scalar('unscaled_loss/aux_fape', avgs['avg_unscaled_aux_fape_loss'], epoch)
     if 'avg_unscaled_vq_loss' in avgs:
         writer.add_scalar('unscaled_loss/vq', avgs['avg_unscaled_vq_loss'], epoch)
     if 'avg_unscaled_tik_tok_padding_loss' in avgs:
@@ -412,10 +427,6 @@ def log_tensorboard_epoch(writer,
     if include_ntp and 'avg_unscaled_ntp_loss' in avgs:
         writer.add_scalar('unscaled_loss/ntp', avgs['avg_unscaled_ntp_loss'], epoch)
 
-    writer.add_scalar('metric/mae', metrics_values['mae'], epoch)
-    writer.add_scalar('metric/rmsd', metrics_values['rmsd'], epoch)
-    writer.add_scalar('metric/gdtts', metrics_values['gdtts'], epoch)
-    writer.add_scalar('metric/tm_score', metrics_values['tm_score'], epoch)
     tik_tok_acc = metrics_values.get('tik_tok_padding_accuracy', float('nan'))
     if tik_tok_acc == tik_tok_acc:
         writer.add_scalar('metric/padding_accuracy', tik_tok_acc, epoch)

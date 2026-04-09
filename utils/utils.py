@@ -30,16 +30,12 @@ def load_all_configs():
     if compose is None or initialize is None:
         raise RuntimeError("Hydra is not available; cannot compose legacy configs.")
 
-    # Initialize Hydra
-    config_path = "configs"  # Path to your config directory
-
     with initialize(version_base=None, config_path="."):
-        # Compose the configuration
         cfg = compose(
-            config_name="config_vqvae",  # Main config
+            config_name="config_vqvae_dihedral",  # Main config
             overrides=[
-                "+encoder=config_gcpnet_encoder",  # Load encoder config
-                "+decoder=config_geometric_decoder",  # Load decoder config
+                "+encoder=config_gcpnet_encoder_rna",  # Load encoder config
+                "+decoder=config_rna_af2_decoder",  # Load decoder config
             ]
         )
 
